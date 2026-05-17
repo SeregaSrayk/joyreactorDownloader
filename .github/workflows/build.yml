@@ -49,7 +49,12 @@ jobs:
             label: macos
             artifact: joyreactorDownloader-macos
             artifact-path: cmd/joyreactor-gui/build/bin/joyreactorDownloader.app
-            build-flags: "-clean"
+            # darwin/universal produces a fat binary containing both arm64
+            # (Apple Silicon) and amd64 (Intel) slices — required because
+            # GitHub's macos-latest runner is Apple Silicon, so a default
+            # build would refuse to launch on Intel Macs with "приложение
+            # не поддерживается на этом Mac".
+            build-flags: "-clean -platform darwin/universal"
 
     steps:
       - uses: actions/checkout@v4
