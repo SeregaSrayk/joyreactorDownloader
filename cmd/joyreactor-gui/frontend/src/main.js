@@ -47,6 +47,7 @@ const state = {
   settingsOpen: false,
   searching: false,
   count: null,
+  exhausted: false,         // set when doSearch concludes the API has nothing more to give for the current filters
   page: 1,
   results: [],
   jobs: [],
@@ -641,7 +642,12 @@ function isFinished(s) {
 
 function renderPreviewCard() {
   const hasResults = state.results.length > 0;
-  const hasMore = state.count != null && state.results.length < state.count;
+  // hasMore is "are there more API pages worth fetching?". state.exhausted is
+  // set when the doSearch loop has good reason to stop: JR returned an
+  // empty page, the user-defined PageTo was reached, or count was hit.
+  // Without that flag the button kept hovering even when a hard media-type
+  // filter dropped 99% of results but the raw count was still high.
+  const hasMore = !state.exhausted && state.count != null && state.results.length < state.count;
   const header = hasResults
     ? `Превью: ${state.results.length}${state.count != null ? ` из ${state.count}${state.count >= 1000 ? '+' : ''}` : ''}`
     : 'Превью';
@@ -1621,6 +1627,7 @@ async function doSearch(reset) {
   if (reset) {
     state.results = [];
     state.count = null;
+    state.exhausted = false;
     state.page = Math.max(0, pageFrom - 1);   // next page = pageFrom
     // The previously-selected post ids would no longer match any visible
     // tile, so clear them to avoid invisible selection state.
@@ -1639,6 +1646,7 @@ async function doSearch(reset) {
       if (pageTo > 0 && nextPage > pageTo) {
         // User-defined upper bound reached.
         state.page = nextPage - 1;
+        state.exhausted = true;
         break;
       }
       const res = await Search(collectInput(nextPage));
@@ -1651,6 +1659,7 @@ async function doSearch(reset) {
       if (rawPosts.length === 0) {
         // End of results — bump page so the next click doesn't re-query the same one.
         state.page = nextPage;
+        state.exhausted = true;
         break;
       }
       // Apply the Settings → "Тип медиа" filter to the preview itself: drop
@@ -1667,7 +1676,10 @@ async function doSearch(reset) {
       // Mid-loop render so the user sees the grid filling in instead of a long blank.
       render({ skipCapture: true });
       // If we've hit JR's total count, stop early — more API calls would just return [].
-      if (state.count != null && state.results.length >= state.count) break;
+      if (state.count != null && state.results.length >= state.count) {
+        state.exhausted = true;
+        break;
+      }
     }
   } catch (e) {
     showToast('error', String(e));
