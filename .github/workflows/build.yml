@@ -121,11 +121,29 @@ jobs:
           done
           ls -la dist/
 
+      # Per-version release notes can live in docs/releases/<tag>.md.
+      # If that file exists for the tag being built, use it as the release
+      # body (auto-gen still appends commit summary at the bottom). If
+      # not, fall through to pure auto-gen.
+      - name: Resolve release-notes file for this tag
+        id: notes
+        shell: bash
+        run: |
+          f="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$f" ]; then
+            echo "Using $f as release body"
+            echo "path=$f" >> "$GITHUB_OUTPUT"
+          else
+            echo "No $f — falling back to auto-generated release notes"
+          fi
+
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
-          # Auto-fills body from commits since the previous release.
+          body_path: ${{ steps.notes.outputs.path }}
+          # Generates the commit summary below body_path's content (or
+          # alone, when no notes file is present).
           generate_release_notes: true
           # Draft so you can review/edit before going public. Flip to false
           # if you want every tag-push to auto-publish.
