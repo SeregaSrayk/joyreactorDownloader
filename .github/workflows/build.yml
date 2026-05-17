@@ -111,19 +111,38 @@ jobs:
         with:
           path: artifacts
 
-      - name: Package per-platform zips with version in the name
+      # Package per-platform release assets with the version in the name.
+      # Format choice per platform:
+      #   Windows: raw .exe — no wrapper; users just download-and-run
+      #   macOS:   .zip     — required, .app is a directory bundle
+      #   Linux:   .tar.gz  — preserves the executable bit (zip on Win
+      #                       runners can strip it)
+      - name: Package release assets
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
           mkdir -p dist
-          for label in windows linux macos; do
-            src="artifacts/joyreactorDownloader-${label}"
-            if [[ -d "$src" ]]; then
-              # Re-zip so the asset filename carries the version (the raw
-              # build artifact is just the .exe / binary / .app bundle).
-              (cd "$src" && zip -qr "../../dist/joyreactorDownloader-${VERSION}-${label}.zip" .)
-            fi
-          done
+
+          # Windows: just rename the .exe with version in filename.
+          win="artifacts/joyreactorDownloader-windows/joyreactorDownloader.exe"
+          if [[ -f "$win" ]]; then
+            cp "$win" "dist/joyreactorDownloader-${VERSION}.exe"
+          fi
+
+          # macOS: zip the .app bundle (it's a directory).
+          mac_src="artifacts/joyreactorDownloader-macos"
+          if [[ -d "$mac_src" ]]; then
+            (cd "$mac_src" && zip -qr "../../dist/joyreactorDownloader-${VERSION}-macos.zip" .)
+          fi
+
+          # Linux: tar.gz with the binary inside, preserving +x perms.
+          lin="artifacts/joyreactorDownloader-linux/joyreactorDownloader"
+          if [[ -f "$lin" ]]; then
+            chmod +x "$lin"   # belt-and-suspenders: GHA-uploaded artifact may have lost it
+            tar -czf "dist/joyreactorDownloader-${VERSION}-linux.tar.gz" \
+              -C "artifacts/joyreactorDownloader-linux" joyreactorDownloader
+          fi
+
           ls -la dist/
 
       # Per-version release notes live in docs/releases/<tag>.md. We read
@@ -150,7 +169,11 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          # Match raw .exe, .zip (macOS), .tar.gz (Linux) — glob covers all.
+          files: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.tar.gz
           body: ${{ steps.notes.outputs.body }}
           # When body is set, this appends the auto-generated commit summary
           # below it. When body is empty, generates the body from scratch.
