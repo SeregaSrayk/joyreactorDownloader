@@ -101,6 +101,11 @@ jobs:
     permissions:
       contents: write    # required to create releases & upload assets
     steps:
+      # Checkout is required so the next "Read release-notes file" step can
+      # see docs/releases/<tag>.md. Without this, the release job has no
+      # working copy of the repo — only the artifacts from build/.
+      - uses: actions/checkout@v4
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
