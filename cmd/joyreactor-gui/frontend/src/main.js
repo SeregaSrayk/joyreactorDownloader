@@ -100,23 +100,19 @@ function render(opts = {}) {
   });
 }
 
-// shouldDeferRender returns true when wiping #app innerHTML would interrupt
-// the user's interaction: a tag/author autocomplete dropdown is open, or
-// focus is in a text input they're typing into. Background events fired
-// during active downloads (job:update streams) would otherwise destroy
-// dropdowns and steal focus on every tick.
+// shouldDeferRender returns true only while an autocomplete dropdown is
+// actually visible — wiping #app innerHTML mid-selection would destroy
+// the dropdown before the user can click an item. We do NOT defer just
+// because an input is focused: that would block re-renders forever while
+// the user is typing (and break tag-pick → chip-appears flow, since after
+// pick the input keeps focus).
 function shouldDeferRender() {
-  if (document.querySelector('.autocomplete')) return true;
-  const a = document.activeElement;
-  if (!a) return false;
-  if (a.tagName === 'INPUT' && a.type !== 'checkbox' && a.type !== 'radio' && a.type !== 'button' && a.type !== 'submit') return true;
-  if (a.tagName === 'TEXTAREA') return true;
-  return false;
+  return !!document.querySelector('.autocomplete');
 }
 
 function doRender() {
   if (!_pendingOpts.immediate && shouldDeferRender()) {
-    // Re-poll every 250ms; as soon as the interaction ends, render with
+    // Re-poll every 250ms; as soon as the dropdown closes, render with
     // the accumulated state. _pendingOpts is intentionally not cleared so
     // skipCapture (and any other sticky flag) survives until the flush.
     if (!_deferTimer) {
@@ -126,6 +122,17 @@ function doRender() {
   }
   const opts = _pendingOpts;
   _pendingOpts = {};
+  // Save focused element + caret position so re-rendering doesn't yank
+  // the cursor out from under the user. Most rebuilds happen on background
+  // job:update events while the user is actively editing a filter field.
+  const focusedId = document.activeElement?.id || '';
+  let focusedSel = null;
+  if (focusedId) {
+    const a = document.activeElement;
+    if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA')) {
+      try { focusedSel = { start: a.selectionStart, end: a.selectionEnd }; } catch {}
+    }
+  }
   if (!opts.skipCapture) captureInputs();
   // Preserve scroll positions across the full innerHTML rebuild, so loading
   // more results (or any background event) doesn't yank the user back to the
@@ -160,6 +167,18 @@ function doRender() {
   `;
   restoreInputs();
   wireEvents();
+  // Re-apply focus + caret to the same element id (if it still exists in
+  // the rebuilt DOM). Without this, every background re-render kicks the
+  // cursor out of whatever field the user was typing in.
+  if (focusedId) {
+    const el = document.getElementById(focusedId);
+    if (el && typeof el.focus === 'function') {
+      el.focus();
+      if (focusedSel && typeof el.setSelectionRange === 'function') {
+        try { el.setSelectionRange(focusedSel.start, focusedSel.end); } catch {}
+      }
+    }
+  }
   for (const sel of scrollSelectors) {
     const el = $(sel);
     if (el) el.scrollTop = prevScrolls[sel];

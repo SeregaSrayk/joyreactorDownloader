@@ -38,6 +38,7 @@ func main() {
 		// individual images from the preview overlay or comments.
 		EnableDefaultContextMenu: true,
 		OnStartup:                gui.startup,
+		OnShutdown:               gui.shutdown,
 		Bind: []any{
 			gui,
 		},

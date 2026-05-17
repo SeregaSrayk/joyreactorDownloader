@@ -52,6 +52,43 @@ func (g *GUI) startup(ctx context.Context) {
 	_ = g.gql.LoadSession(g.sessionPath)
 	// Best-effort background refresh of the blocked-tag list (if session was restored).
 	go g.refreshBlockedTags()
+	// JR rotates session cookies on subsequent requests — without periodic
+	// flush the disk copy goes stale, and on next launch we'd restore an
+	// invalidated cookie and appear logged out. Flush every 5 min while
+	// logged in; the on-shutdown hook covers normal app close.
+	go g.sessionPersistLoop()
+}
+
+// shutdown is wired as the Wails OnShutdown callback; it flushes the most
+// recent session cookies to disk so the next launch sees what JR has
+// rotated to during this run, not whatever was current at login time.
+func (g *GUI) shutdown(_ context.Context) {
+	if g.sessionPath == "" {
+		return
+	}
+	_ = g.gql.SaveSession(g.sessionPath)
+}
+
+// sessionPersistLoop periodically writes the current cookie jar to disk
+// while the user is logged in. JR may rotate the session token on the
+// server during normal API traffic; if we crash or are force-killed
+// before shutdown runs, the on-disk copy would otherwise be stale.
+func (g *GUI) sessionPersistLoop() {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-g.ctx.Done():
+			return
+		case <-t.C:
+			// Only persist when we actually have a session — avoids
+			// overwriting on disk with an empty jar after the user
+			// logged out from a different process.
+			if name, _ := g.gql.Me(g.ctx); name != "" {
+				_ = g.gql.SaveSession(g.sessionPath)
+			}
+		}
+	}
 }
 
 // refreshBlockedTags fetches the authenticated user's blocked tag list and
