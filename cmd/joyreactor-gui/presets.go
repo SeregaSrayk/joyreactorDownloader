@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Preset stores a named snapshot of filter + download settings, including
@@ -36,6 +37,18 @@ type Preset struct {
 	PageFrom        int    `json:"pageFrom,omitempty"`
 	PageTo          int    `json:"pageTo,omitempty"`
 	OutDir          string `json:"outDir,omitempty"`
+
+	// AutoPull opts this preset into the background scheduler. When true,
+	// the scheduler enqueues a job for this preset whenever the global
+	// interval (AppSettings.AutoPullIntervalHours) has elapsed since
+	// LastAutoPullAt. Default false (no schedule).
+	AutoPull bool `json:"autoPull,omitempty"`
+
+	// LastAutoPullAt is the timestamp at which the scheduler last STARTED
+	// (not finished) an auto-pull job for this preset. Updated when the
+	// job is enqueued — this way a crash mid-download doesn't cause an
+	// immediate retry on next launch; we wait the full interval again.
+	LastAutoPullAt time.Time `json:"lastAutoPullAt,omitempty"`
 }
 
 type presetStore struct {
@@ -111,6 +124,49 @@ func (s *presetStore) Delete(name string) error {
 		return errors.New("пресет не найден")
 	}
 	delete(s.Presets, name)
+	return s.saveLocked()
+}
+
+// All returns a snapshot of all presets keyed by name. Used by the
+// scheduler to walk through opted-in presets without holding the lock
+// for the duration of a job spawn.
+func (s *presetStore) All() map[string]Preset {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]Preset, len(s.Presets))
+	for k, v := range s.Presets {
+		out[k] = v
+	}
+	return out
+}
+
+// SetAutoPull toggles the AutoPull flag for a preset without rewriting
+// the other fields. Used by the GUI checkbox in the preset row.
+func (s *presetStore) SetAutoPull(name string, on bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.Presets[name]
+	if !ok {
+		return errors.New("пресет не найден")
+	}
+	p.AutoPull = on
+	s.Presets[name] = p
+	return s.saveLocked()
+}
+
+// MarkAutoPullStarted records the scheduler's intent to fire a job for
+// this preset right now. Updates LastAutoPullAt, so the next eligibility
+// check waits the full interval again — even if the job ends up failing
+// or being cancelled.
+func (s *presetStore) MarkAutoPullStarted(name string, t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.Presets[name]
+	if !ok {
+		return errors.New("пресет не найден")
+	}
+	p.LastAutoPullAt = t
+	s.Presets[name] = p
 	return s.saveLocked()
 }
 

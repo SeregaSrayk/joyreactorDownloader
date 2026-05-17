@@ -16,10 +16,39 @@ type AppSettings struct {
 	// Switching modes only affects future jobs; existing per-folder manifests
 	// are left alone and existing global one is reused.
 	ManifestMode string `json:"manifestMode"`
+
+	// AutoPullIntervalHours is the global cadence for the scheduled-pull
+	// feature. Presets opt in individually via Preset.AutoPull; whenever
+	// now ≥ Preset.LastAutoPullAt + AutoPullIntervalHours, the scheduler
+	// enqueues a fresh job for that preset. Default 24 (once a day).
+	// Minimum 1 hour — anything faster would hammer the JR API.
+	AutoPullIntervalHours int `json:"autoPullIntervalHours"`
+
+	// Autostart toggles whether the app registers itself to launch on user
+	// login (Windows: HKCU\...\Run; macOS: LaunchAgent plist; Linux:
+	// ~/.config/autostart/joyreactorDownloader.desktop).
+	Autostart bool `json:"autostart"`
+
+	// StartMinimized — when true, the window launches hidden (in the system
+	// tray) instead of showing on screen. Useful in combination with
+	// Autostart so the app boots into the background without interrupting
+	// the user.
+	StartMinimized bool `json:"startMinimized"`
+
+	// MinimizeToTrayOnClose — when true, clicking the window close button
+	// hides the window to tray instead of quitting the app. The tray icon's
+	// "Выход" menu item still quits explicitly.
+	MinimizeToTrayOnClose bool `json:"minimizeToTrayOnClose"`
 }
 
 func defaultAppSettings() AppSettings {
-	return AppSettings{ManifestMode: "per-folder"}
+	return AppSettings{
+		ManifestMode:          "per-folder",
+		AutoPullIntervalHours: 24,
+		Autostart:             false,
+		StartMinimized:        false,
+		MinimizeToTrayOnClose: false,
+	}
 }
 
 func appSettingsFilePath() string {
@@ -57,6 +86,12 @@ func loadAppSettings() AppSettings {
 	case "per-folder", "global":
 		s.ManifestMode = loaded.ManifestMode
 	}
+	if loaded.AutoPullIntervalHours >= 1 {
+		s.AutoPullIntervalHours = loaded.AutoPullIntervalHours
+	}
+	s.Autostart = loaded.Autostart
+	s.StartMinimized = loaded.StartMinimized
+	s.MinimizeToTrayOnClose = loaded.MinimizeToTrayOnClose
 	return s
 }
 
