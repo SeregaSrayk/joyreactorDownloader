@@ -60,6 +60,11 @@ func (t *trayController) Start() {
 		systray.SetTitle("Joyreactor Downloader")
 		systray.SetTooltip("Joyreactor Downloader")
 
+		// Left-click on the tray icon shows the window — that's the standard
+		// Windows tray-app behaviour ("click to bring app back to front").
+		// Right-click still opens the menu (handled by systray defaults).
+		systray.SetOnTapped(t.showWindow)
+
 		mShow := systray.AddMenuItem("Показать окно", "Развернуть основное окно")
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("Выход", "Закрыть приложение")
@@ -68,10 +73,7 @@ func (t *trayController) Start() {
 			for {
 				select {
 				case <-mShow.ClickedCh:
-					if t.gui.ctx != nil {
-						wailsruntime.WindowShow(t.gui.ctx)
-						wailsruntime.WindowUnminimise(t.gui.ctx)
-					}
+					t.showWindow()
 				case <-mQuit.ClickedCh:
 					t.mu.Lock()
 					t.quitting = true
@@ -110,4 +112,20 @@ func (t *trayController) IsQuitting() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.quitting
+}
+
+// showWindow brings the main window back from a hidden / minimized state
+// and focuses it. Called from the tray "Показать окно" menu item and the
+// left-click handler on the tray icon. The AlwaysOnTop flicker is the
+// documented Wails trick to force focus on Windows; without it WindowShow
+// only restores the window to its previous z-order, which may still be
+// behind everything else.
+func (t *trayController) showWindow() {
+	if t.gui == nil || t.gui.ctx == nil {
+		return
+	}
+	wailsruntime.WindowShow(t.gui.ctx)
+	wailsruntime.WindowUnminimise(t.gui.ctx)
+	wailsruntime.WindowSetAlwaysOnTop(t.gui.ctx, true)
+	wailsruntime.WindowSetAlwaysOnTop(t.gui.ctx, false)
 }
