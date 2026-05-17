@@ -34,14 +34,22 @@ jobs:
             label: linux
             artifact: joyreactorDownloader-linux
             artifact-path: cmd/joyreactor-gui/build/bin/joyreactorDownloader
+            build-flags: "-clean"
+          # Windows runner builds BOTH the raw exe and a NSIS installer in one
+          # pass. `-nsis -webview2 embed` bakes the WebView2 bootstrapper into
+          # the installer for users whose Win10 didn't get WebView2 via
+          # Windows Update (rare but not zero). artifact-path is a glob so
+          # both .exe files end up at the artifact root.
           - os: windows-latest
             label: windows
             artifact: joyreactorDownloader-windows
-            artifact-path: cmd/joyreactor-gui/build/bin/joyreactorDownloader.exe
+            artifact-path: cmd/joyreactor-gui/build/bin/*.exe
+            build-flags: "-clean -nsis -webview2 embed"
           - os: macos-latest
             label: macos
             artifact: joyreactorDownloader-macos
             artifact-path: cmd/joyreactor-gui/build/bin/joyreactorDownloader.app
+            build-flags: "-clean"
 
     steps:
       - uses: actions/checkout@v4
@@ -75,10 +83,13 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 
       # wails.json + main.go live in cmd/joyreactor-gui/ per the project
-      # layout. Wails CLI uses the cwd to find its anchor.
+      # layout. Wails CLI uses the cwd to find its anchor. Build flags
+      # per platform come from the matrix (Windows builds the NSIS
+      # installer with embedded WebView2 bootstrapper in addition to the
+      # raw .exe).
       - name: Build
         working-directory: cmd/joyreactor-gui
-        run: wails build -clean
+        run: wails build ${{ matrix.build-flags }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -113,20 +124,31 @@ jobs:
 
       # Package per-platform release assets with the version in the name.
       # Format choice per platform:
-      #   Windows: raw .exe — no wrapper; users just download-and-run
-      #   macOS:   .zip     — required, .app is a directory bundle
-      #   Linux:   .tar.gz  — preserves the executable bit (zip on Win
-      #                       runners can strip it)
+      #   Windows: raw .exe (portable) + setup.exe (NSIS installer with
+      #            embedded WebView2 bootstrapper — for users whose Win10
+      #            doesn't already have it)
+      #   macOS:   .zip (required, .app is a directory bundle)
+      #   Linux:   .tar.gz (preserves executable bit, which zip can strip)
       - name: Package release assets
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
           mkdir -p dist
 
-          # Windows: just rename the .exe with version in filename.
+          # Windows raw exe — portable, no install. Wails defaults the
+          # binary name to joyreactorDownloader.exe.
           win="artifacts/joyreactorDownloader-windows/joyreactorDownloader.exe"
           if [[ -f "$win" ]]; then
             cp "$win" "dist/joyreactorDownloader-${VERSION}.exe"
+          fi
+
+          # Windows NSIS installer — Wails names it
+          # joyreactorDownloader-amd64-installer.exe by default; rename
+          # with version suffix and "setup" so users see two clearly-
+          # different files on the Releases page.
+          setup="artifacts/joyreactorDownloader-windows/joyreactorDownloader-amd64-installer.exe"
+          if [[ -f "$setup" ]]; then
+            cp "$setup" "dist/joyreactorDownloader-${VERSION}-setup.exe"
           fi
 
           # macOS: zip the .app bundle (it's a directory).
