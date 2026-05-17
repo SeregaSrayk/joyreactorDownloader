@@ -72,16 +72,48 @@ function escape(s) {
 }
 
 // ----- Render -----
+// render() coalesces calls through requestAnimationFrame so a burst of
+// job:update events (one per downloaded picture) collapses to at most one
+// DOM rebuild per ~16ms frame — eliminates flicker and CPU thrash during
+// active downloads. Callers can pass {immediate: true} to force a sync
+// render when the user just did something and expects instant feedback.
+let _renderScheduled = false;
+let _pendingOpts = {};
 function render(opts = {}) {
-  // Default: snapshot current DOM input values so re-renders triggered by
-  // background events (job:update etc.) don't wipe out what the user is typing.
-  // Callers that just mutated state.formInputs (e.g. applyPreset) pass
-  // {skipCapture: true} to keep their fresh values.
+  // Merge opts in case multiple callers queue up before the frame fires.
+  // skipCapture is sticky: any caller that asks to skip wins, since the
+  // captureInputs side-effect would clobber freshly-mutated state.
+  if (opts.skipCapture) _pendingOpts.skipCapture = true;
+  if (opts.immediate) {
+    _pendingOpts = { ..._pendingOpts, ...opts };
+    return doRender();
+  }
+  if (_renderScheduled) return;
+  _renderScheduled = true;
+  requestAnimationFrame(() => {
+    _renderScheduled = false;
+    doRender();
+  });
+}
+
+function doRender() {
+  const opts = _pendingOpts;
+  _pendingOpts = {};
   if (!opts.skipCapture) captureInputs();
   // Preserve scroll positions across the full innerHTML rebuild, so loading
   // more results (or any background event) doesn't yank the user back to the
-  // top of any scrollable pane.
-  const scrollSelectors = ['.main', '.preview-scroll', '.post-overlay-pics', '.comments-list'];
+  // top of any scrollable pane. Includes modal-internal scrolls (Settings
+  // dialog, Queue table) — otherwise opening Settings and waiting for a
+  // job:update would scroll the modal back to top.
+  const scrollSelectors = [
+    '.main',
+    '.preview-scroll',
+    '.post-overlay-pics',
+    '.comments-list',
+    '.modal.wide',           // Settings modal (overflow-y:auto on the modal itself)
+    '.modal.queue-modal',    // Queue modal outer
+    '.queue-table-wrap',     // Queue table scroll container
+  ];
   const prevScrolls = Object.fromEntries(
     scrollSelectors.map(s => [s, $(s)?.scrollTop ?? 0])
   );
