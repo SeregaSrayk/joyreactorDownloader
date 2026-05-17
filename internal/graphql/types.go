@@ -58,6 +58,13 @@ type Tag struct {
 	// transliterated for Cyrillic). Equal to Name for most English tags.
 	// Used to build webm transcode URLs at /pics/post/webm/<seoName>-<attrId>.webm.
 	SeoName string `json:"seoName,omitempty"`
+	// MainTag is JR's canonical tag for this variant — JR groups variant
+	// spellings (Latin/Cyrillic, casing) under a single canonical tag.
+	// Self-pointing for canonical tags themselves.
+	// Used by ExcludeTags matching to catch aliased variants of a blocked tag.
+	MainTag *struct {
+		Name string `json:"name"`
+	} `json:"mainTag,omitempty"`
 }
 
 // TagSuggestion is one autocomplete result. Count is the number of posts under

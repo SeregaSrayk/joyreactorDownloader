@@ -148,9 +148,23 @@ func buildSearchParams(c filter.Criteria, page int) graphql.SearchParams {
 }
 
 func tagNames(p graphql.Post) []string {
-	out := make([]string, len(p.Tags))
-	for i, t := range p.Tags {
-		out[i] = t.Name
+	out := make([]string, 0, len(p.Tags)*2)
+	seen := make(map[string]struct{}, len(p.Tags)*2)
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	for _, t := range p.Tags {
+		add(t.Name)
+		if t.MainTag != nil {
+			add(t.MainTag.Name)
+		}
 	}
 	return out
 }

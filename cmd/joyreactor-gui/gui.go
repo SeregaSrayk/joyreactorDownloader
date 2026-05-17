@@ -289,7 +289,8 @@ func (g *GUI) Search(in SearchInput) SearchOutput {
 		}
 		// Client-side: drop posts whose tag set intersects c.ExcludeTags
 		// (which includes the user's profile-blocked tags when the toggle is on).
-		if !c.MatchPostTags(tagNames(p)) {
+		// tagNamesForMatching expands aliases via Tag.mainTag.
+		if !c.MatchPostTags(tagNamesForMatching(p)) {
 			continue
 		}
 		thumb, _ := p.ThumbnailURL()
@@ -637,7 +638,7 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 			if !c.MatchPostDate(p.CreatedAt) {
 				continue
 			}
-			if !c.MatchPostTags(tagNames(p)) {
+			if !c.MatchPostTags(tagNamesForMatching(p)) {
 				continue
 			}
 			for _, a := range p.Attributes {
@@ -805,6 +806,31 @@ func tagNames(p graphql.Post) []string {
 	out := make([]string, len(p.Tags))
 	for i, t := range p.Tags {
 		out[i] = t.Name
+	}
+	return out
+}
+
+// tagNamesForMatching returns both the literal tag names and their mainTag
+// names — JR groups variant tags under a canonical one via Tag.mainTag,
+// so a profile-blocked canonical tag should also catch its variants.
+func tagNamesForMatching(p graphql.Post) []string {
+	out := make([]string, 0, len(p.Tags)*2)
+	seen := make(map[string]struct{}, len(p.Tags)*2)
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	for _, t := range p.Tags {
+		add(t.Name)
+		if t.MainTag != nil {
+			add(t.MainTag.Name)
+		}
 	}
 	return out
 }

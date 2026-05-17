@@ -8,7 +8,7 @@ import (
 const postFields = `
   id rating createdAt nsfw unsafe
   user { username }
-  tags { name seoName }
+  tags { name seoName mainTag { name } }
   attributes {
     __typename id type
     ... on PostAttributePicture { image { id width height type hasVideo } }
