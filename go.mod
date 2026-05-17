@@ -1,10 +1,12 @@
 module joyreactorDownloader
 
-go 1.22.0
+go 1.25.0
 
 require (
+	fyne.io/systray v1.12.1
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3
 	github.com/wailsapp/wails/v2 v2.12.0
+	golang.org/x/sys v0.44.0
 )
 
 require (
@@ -33,6 +35,5 @@ require (
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
 )
