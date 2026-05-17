@@ -82,6 +82,7 @@ function escape(s) {
 // render when the user just did something and expects instant feedback.
 let _renderScheduled = false;
 let _pendingOpts = {};
+let _deferTimer = 0;
 function render(opts = {}) {
   // Merge opts in case multiple callers queue up before the frame fires.
   // skipCapture is sticky: any caller that asks to skip wins, since the
@@ -99,7 +100,30 @@ function render(opts = {}) {
   });
 }
 
+// shouldDeferRender returns true when wiping #app innerHTML would interrupt
+// the user's interaction: a tag/author autocomplete dropdown is open, or
+// focus is in a text input they're typing into. Background events fired
+// during active downloads (job:update streams) would otherwise destroy
+// dropdowns and steal focus on every tick.
+function shouldDeferRender() {
+  if (document.querySelector('.autocomplete')) return true;
+  const a = document.activeElement;
+  if (!a) return false;
+  if (a.tagName === 'INPUT' && a.type !== 'checkbox' && a.type !== 'radio' && a.type !== 'button' && a.type !== 'submit') return true;
+  if (a.tagName === 'TEXTAREA') return true;
+  return false;
+}
+
 function doRender() {
+  if (!_pendingOpts.immediate && shouldDeferRender()) {
+    // Re-poll every 250ms; as soon as the interaction ends, render with
+    // the accumulated state. _pendingOpts is intentionally not cleared so
+    // skipCapture (and any other sticky flag) survives until the flush.
+    if (!_deferTimer) {
+      _deferTimer = setTimeout(() => { _deferTimer = 0; render(); }, 250);
+    }
+    return;
+  }
   const opts = _pendingOpts;
   _pendingOpts = {};
   if (!opts.skipCapture) captureInputs();
