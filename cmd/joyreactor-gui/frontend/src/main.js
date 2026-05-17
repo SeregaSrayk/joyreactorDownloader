@@ -7,7 +7,7 @@ import {
   ListPresets, GetPreset, SavePreset, DeletePreset,
   GetWindowSettings, SaveWindowSettings,
   GetAppSettings, SaveAppSettings,
-  ManifestKeys,
+  ManifestKeys, OpenManifestFolder, DeleteManifest,
   TagSuggest, CheckUser, SuggestUsers, BlockedTagCount,
   PostComments,
 } from '../wailsjs/go/main/GUI';
@@ -403,6 +403,14 @@ function renderSettingsModal() {
             хочешь дубликатов на диске между разными подборками. Переключение
             влияет только на новые задачи — уже запущенные продолжают со своим
             манифестом.
+          </div>
+          <div class="actions-row manifest-actions">
+            <button class="btn small" id="btn-open-manifest" title="Открыть папку, в которой лежит активный манифест">
+              📂 Открыть папку манифеста
+            </button>
+            <button class="btn small danger" id="btn-delete-manifest" title="Удалить файл манифеста — все картинки снова будут считаться нескачанными">
+              🗑️ Удалить манифест
+            </button>
           </div>
         </div>
 
@@ -1126,6 +1134,29 @@ function wireEvents() {
       // The set of "already downloaded" tiles depends on which manifest
       // is consulted — refresh the badge cache after switching modes so
       // the grid updates immediately.
+      await refreshDownloadedKeys();
+      render({ skipCapture: true });
+    });
+  });
+
+  $('#btn-open-manifest')?.addEventListener('click', async () => {
+    const outDir = state.formInputs['f-outdir'] || '';
+    const err = await OpenManifestFolder(outDir);
+    if (err) showToast('error', err);
+  });
+
+  $('#btn-delete-manifest')?.addEventListener('click', () => {
+    const outDir = state.formInputs['f-outdir'] || '';
+    const where = state.appSettings.manifestMode === 'global'
+      ? 'общий манифест в %APPDATA%'
+      : `манифест папки «${outDir || '(не выбрана)'}»`;
+    showConfirm(`Удалить ${where}? Все картинки оттуда снова будут считаться нескачанными.`, async () => {
+      const err = await DeleteManifest(outDir);
+      if (err) {
+        showToast('error', err);
+        return;
+      }
+      showToast('success', 'Манифест удалён');
       await refreshDownloadedKeys();
       render({ skipCapture: true });
     });

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -436,6 +437,51 @@ func (g *GUI) SaveAppSettings(s AppSettings) string {
 		return err.Error()
 	}
 	return ""
+}
+
+// OpenManifestFolder opens the directory that holds the active manifest
+// in the OS file manager. Active path depends on AppSettings.ManifestMode:
+// per-folder mode opens outDir, global mode opens the app config dir.
+// Returns "" on success or the error message.
+func (g *GUI) OpenManifestFolder(outDir string) string {
+	dir, err := activeManifestFolder(outDir)
+	if err != nil {
+		return err.Error()
+	}
+	return g.OpenOutputFolder(dir)
+}
+
+// DeleteManifest removes the active manifest file (per current
+// ManifestMode). After deletion, the green "downloaded" badges in the UI
+// will disappear on the next refresh. Returns "" on success, error
+// message otherwise. Missing file is NOT an error — idempotent.
+func (g *GUI) DeleteManifest(outDir string) string {
+	settings := loadAppSettings()
+	var path string
+	if settings.ManifestMode == "global" {
+		path = globalManifestPath()
+	} else {
+		if outDir == "" {
+			return "укажи папку для скачивания, чтобы найти манифест"
+		}
+		path = filepath.Join(outDir, ".manifest.json")
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err.Error()
+	}
+	return ""
+}
+
+// activeManifestFolder resolves the parent directory of the active
+// manifest. Mirrors manifestPathFor's logic.
+func activeManifestFolder(outDir string) (string, error) {
+	if loadAppSettings().ManifestMode == "global" {
+		return filepath.Dir(globalManifestPath()), nil
+	}
+	if outDir == "" {
+		return "", errors.New("укажи папку для скачивания, чтобы найти манифест")
+	}
+	return outDir, nil
 }
 
 // ===== Window =====

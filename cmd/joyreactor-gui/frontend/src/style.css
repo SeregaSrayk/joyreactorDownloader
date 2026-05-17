@@ -967,6 +967,11 @@ body.dragging-select * {
   font-size: 11px;
   word-break: break-all;
 }
+.manifest-actions {
+  margin-top: 10px;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 
 .icon-btn.gear {
   width: 32px;
