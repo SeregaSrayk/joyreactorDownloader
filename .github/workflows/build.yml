@@ -152,9 +152,22 @@ jobs:
           fi
 
           # macOS: zip the .app bundle (it's a directory).
+          # upload-artifact@v4 strips the top-level directory name on upload,
+          # so we get just .app/Contents/ in artifacts/joyreactorDownloader-macos/.
+          # Rewrap into joyreactorDownloader.app/ before zipping so the
+          # archive contains the expected bundle structure for end users.
           mac_src="artifacts/joyreactorDownloader-macos"
           if [[ -d "$mac_src" ]]; then
-            (cd "$mac_src" && zip -qr "../../dist/joyreactorDownloader-${VERSION}-macos.zip" .)
+            mac_stage="artifacts/macos-stage/joyreactorDownloader.app"
+            mkdir -p "$mac_stage"
+            cp -R "$mac_src/." "$mac_stage/"
+            # Belt-and-suspenders: ensure the inner binary stays executable
+            # (upload→download via @v4 generally preserves perms, but this
+            # is the one file that MUST be +x or the .app won't launch).
+            if [[ -f "$mac_stage/Contents/MacOS/joyreactorDownloader" ]]; then
+              chmod +x "$mac_stage/Contents/MacOS/joyreactorDownloader"
+            fi
+            (cd "artifacts/macos-stage" && zip -qr "../../dist/joyreactorDownloader-${VERSION}-macos.zip" "joyreactorDownloader.app")
           fi
 
           # Linux: tar.gz with the binary inside, preserving +x perms.
