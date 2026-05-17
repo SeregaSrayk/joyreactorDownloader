@@ -68,29 +68,13 @@ func startSystray(getCtx func() context.Context, onQuit func()) {
 		// Left-click on the tray icon mirrors the menu's «Показать окно»
 		// item — standard Windows tray-app behaviour. Right-click still
 		// opens the contextual menu.
-		systray.SetOnTapped(func() {
-			ctx := getCtx()
-			if ctx == nil {
-				return
-			}
-			wailsruntime.WindowShow(ctx)
-			wailsruntime.WindowUnminimise(ctx)
-			wailsruntime.WindowSetAlwaysOnTop(ctx, true)
-			wailsruntime.WindowSetAlwaysOnTop(ctx, false)
-		})
+		systray.SetOnTapped(func() { restoreFromTray(getCtx()) })
 
 		go func() {
 			for {
 				select {
 				case <-showItem.ClickedCh:
-					ctx := getCtx()
-					if ctx == nil {
-						continue
-					}
-					wailsruntime.WindowShow(ctx)
-					wailsruntime.WindowUnminimise(ctx)
-					wailsruntime.WindowSetAlwaysOnTop(ctx, true)
-					wailsruntime.WindowSetAlwaysOnTop(ctx, false)
+					restoreFromTray(getCtx())
 				case <-quitItem.ClickedCh:
 					tray.mu.Lock()
 					tray.quitting = true
@@ -110,4 +94,33 @@ func startSystray(getCtx func() context.Context, onQuit func()) {
 // even if Run hasn't started yet (it does nothing in that case).
 func stopSystray() {
 	systray.Quit()
+}
+
+// restoreFromTray brings the window back from a hidden state and forces
+// it to the size/maximize state the user configured. Without re-applying
+// these settings here, Wails's WindowShow restores the window with the
+// initial size from wails.Run() options — which means a user who had
+// maximized or resized the window before sending it to tray gets a tiny
+// default window back instead of what they expect.
+//
+// AlwaysOnTop flicker is the documented Wails trick to force focus on
+// Windows — true→false brings the window to the front of the z-order
+// without leaving it pinned on top.
+func restoreFromTray(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	wailsruntime.WindowShow(ctx)
+	wailsruntime.WindowUnminimise(ctx)
+	ws := loadWindowSettings()
+	if ws.Maximized {
+		wailsruntime.WindowMaximise(ctx)
+	} else {
+		wailsruntime.WindowUnmaximise(ctx)
+		if ws.Width > 0 && ws.Height > 0 {
+			wailsruntime.WindowSetSize(ctx, ws.Width, ws.Height)
+		}
+	}
+	wailsruntime.WindowSetAlwaysOnTop(ctx, true)
+	wailsruntime.WindowSetAlwaysOnTop(ctx, false)
 }
