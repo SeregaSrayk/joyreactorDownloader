@@ -1,0 +1,2217 @@
+import './style.css';
+import {
+  Login, Logout, Me, Search,
+  AddJob, ListJobs, PauseJob, ResumeJob, CancelJob, RemoveJob, ClearFinishedJobs,
+  PreviewJobName,
+  PickFolder, OpenOutputFolder,
+  ListPresets, GetPreset, SavePreset, DeletePreset,
+  GetWindowSettings, SaveWindowSettings,
+  GetAppSettings, SaveAppSettings,
+  ManifestKeys,
+  TagSuggest, CheckUser, SuggestUsers, BlockedTagCount,
+  PostComments,
+} from '../wailsjs/go/main/GUI';
+import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime';
+
+const LS_SHOW_AUTHOR     = 'jrdl:showAuthor';
+const LS_SHOW_RATING     = 'jrdl:showRating';
+const LS_OUTDIR          = 'jrdl:outdir';
+const LS_FILENAME_FORMAT = 'jrdl:filenameFormat';
+const LS_PREVIEW_BATCH   = 'jrdl:previewBatch';
+const LS_LAST_PRESET     = 'jrdl:lastPreset';
+const LS_MANUAL_SELECT   = 'jrdl:manualSelect';
+
+const lsBool = (key, def) => {
+  const v = localStorage.getItem(key);
+  return v == null ? def : v === '1';
+};
+const lsStr = (key, def) => localStorage.getItem(key) ?? def;
+const lsInt = (key, def) => {
+  const n = parseInt(localStorage.getItem(key) ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : def;
+};
+
+// ----- State -----
+const state = {
+  user: '',
+  tags: [],
+  excludeTags: [],
+  sort: 'rating',
+  kinds: [],               // empty = any; subset of ['image','gif','video']
+  showAuthor: lsBool(LS_SHOW_AUTHOR, false),
+  showRating: lsBool(LS_SHOW_RATING, false),
+  filenameFormat: lsStr(LS_FILENAME_FORMAT, 'id'),
+  previewBatch: lsInt(LS_PREVIEW_BATCH, 25),  // posts to fetch per Найти / Загрузить ещё click
+  settingsOpen: false,
+  searching: false,
+  count: null,
+  page: 1,
+  results: [],
+  jobs: [],
+  formInputs: {
+    'f-use-blocked': true,                  // blocked-tags filter is on by default
+    'f-outdir': lsStr(LS_OUTDIR, ''),       // remember last-used download folder
+  },
+  presets: [],
+  currentPreset: '',
+  blockedCount: 0,
+  postModal: null,   // { post, comments, loading, error } when the right-click preview is open
+  windowSettings: { width: 1180, height: 820, maximized: false },
+  appSettings: { manifestMode: 'per-folder' },
+  downloaded: { outDir: '', keys: new Set() },  // attr IDs in the current outdir's .manifest.json
+  selectedPosts: new Set(),  // postId strings the user manually picked for selective download
+  manualSelect: lsBool(LS_MANUAL_SELECT, false),  // master toggle for the per-tile checkbox UI
+  queueOpen: false,                                // job-queue modal visibility
+};
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+
+function escape(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ----- Render -----
+function render(opts = {}) {
+  // Default: snapshot current DOM input values so re-renders triggered by
+  // background events (job:update etc.) don't wipe out what the user is typing.
+  // Callers that just mutated state.formInputs (e.g. applyPreset) pass
+  // {skipCapture: true} to keep their fresh values.
+  if (!opts.skipCapture) captureInputs();
+  // Preserve scroll positions across the full innerHTML rebuild, so loading
+  // more results (or any background event) doesn't yank the user back to the
+  // top of any scrollable pane.
+  const scrollSelectors = ['.main', '.preview-scroll', '.post-overlay-pics', '.comments-list'];
+  const prevScrolls = Object.fromEntries(
+    scrollSelectors.map(s => [s, $(s)?.scrollTop ?? 0])
+  );
+  document.querySelector('#app').innerHTML = `
+    <div class="shell">
+      ${renderTopbar()}
+      <div class="main">
+        <div class="split">
+          ${renderPreviewCard()}
+          ${renderFiltersCard()}
+        </div>
+      </div>
+      ${state.settingsOpen ? renderSettingsModal() : ''}
+      ${state.queueOpen ? renderQueueModal() : ''}
+      ${state.postModal ? renderPostPreview() : ''}
+    </div>
+  `;
+  restoreInputs();
+  wireEvents();
+  for (const sel of scrollSelectors) {
+    const el = $(sel);
+    if (el) el.scrollTop = prevScrolls[sel];
+  }
+}
+
+// Toast lifecycle is intentionally separate from the main render() loop.
+// The shell does innerHTML rebuilds on every job:update event (one per
+// downloaded picture) which would re-trigger the CSS animation and reset
+// the auto-dismiss timer — making it look like a new toast on every
+// progress tick. Instead we keep a single persistent <div> in document.body
+// and mutate it imperatively.
+let _toastTimer = 0;
+
+function showToast(kind, text) {
+  clearTimeout(_toastTimer);
+  let el = document.getElementById('toast-elem');
+  const isNew = !el;
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast-elem';
+    document.body.appendChild(el);
+  }
+  el.className = `toast ${kind}`;
+  el.setAttribute('role', 'status');
+  el.innerHTML = `
+    <span class="toast-text">${escape(text)}</span>
+    ${kind === 'error' ? `<button class="toast-close" title="Закрыть">✕</button>` : ''}
+  `;
+  el.querySelector('.toast-close')?.addEventListener('click', hideToast);
+  // Replay the entry animation only when the element is brand-new — updating
+  // the same toast shouldn't make it bounce in again.
+  if (isNew) {
+    el.classList.add('toast-enter');
+    requestAnimationFrame(() => el.classList.remove('toast-enter'));
+  }
+  if (kind === 'success') {
+    _toastTimer = setTimeout(hideToast, 4000);
+  }
+}
+
+function hideToast() {
+  clearTimeout(_toastTimer);
+  document.getElementById('toast-elem')?.remove();
+}
+
+function renderTopbar() {
+  const active = countActive();
+  const total = state.jobs.length;
+  const queueBadge = total > 0
+    ? `<span class="topbar-badge ${active > 0 ? 'active' : ''}">${total}</span>`
+    : '';
+  return `
+    <div class="topbar">
+      <div class="title">Joyreactor Downloader</div>
+      <button class="icon-btn gear" id="btn-settings" title="Настройки скачивания">⚙</button>
+      <button class="topbar-btn" id="btn-queue" title="Очередь задач">
+        📋 Очередь${queueBadge}
+      </button>
+      <div class="spacer"></div>
+      <div class="auth">
+        ${state.user
+          ? `<span>вошёл как <span class="user">${escape(state.user)}</span></span>
+             <button class="btn" id="btn-logout">Выйти</button>`
+          : `<span>гость</span>
+             <button class="btn" id="btn-login">Войти</button>`}
+      </div>
+    </div>`;
+}
+
+// renderPresetBar — second sticky row right below the topbar. Holds the
+// preset selector + its save/delete buttons, the output directory input,
+// and the «Добавить в очередь» action. Outdir lives here (not in a bottom
+// bar) because it's now a per-preset field — visually grouped with the
+// preset controls so the "this folder belongs to this preset" mental
+// model is obvious at a glance.
+// renderPresetSection — preset selector + save/delete, lives at the top of
+// the filters card so all "what to download" choices stack vertically in one
+// column. Was a separate top bar previously.
+function renderPresetSection() {
+  const opts = ['<option value="">— пресет —</option>']
+    .concat(state.presets.map(n => `<option value="${escape(n)}" ${n === state.currentPreset ? 'selected' : ''}>${escape(n)}</option>`))
+    .join('');
+  return `
+    <div class="field">
+      <label>Пресет</label>
+      <div class="preset-control">
+        <select id="preset-sel" title="Выбрать пресет фильтров">${opts}</select>
+        <button class="btn small" id="btn-preset-save" title="Сохранить текущие фильтры как пресет">Сохранить как…</button>
+        <button class="btn small" id="btn-preset-delete" ${state.currentPreset ? '' : 'disabled'}>Удалить</button>
+      </div>
+    </div>`;
+}
+
+// renderOutdirSection — output directory input + picker + open-in-explorer.
+// Sits right after the preset so the preset/folder pair stays grouped.
+function renderOutdirSection() {
+  const hasOutdir = !!(state.formInputs['f-outdir'] || '').trim();
+  const hint = state.currentPreset
+    ? `привязана к пресету «${escape(state.currentPreset)}»`
+    : 'без пресета — папка сохраняется в localStorage';
+  return `
+    <div class="field">
+      <label>Папка для скачивания</label>
+      <div class="outdir">
+        <input type="text" id="f-outdir" placeholder="Папка…">
+        <button class="btn" id="btn-pick">Выбрать…</button>
+        <button class="icon-btn" id="btn-open-outdir" title="Открыть папку в проводнике" ${hasOutdir ? '' : 'disabled'}>📂</button>
+      </div>
+      <div class="field-hint">${hint}</div>
+    </div>`;
+}
+
+function renderFiltersCard() {
+  return `
+    <div class="card">
+      <h2>Поиск</h2>
+      ${renderPresetSection()}
+      ${renderOutdirSection()}
+      <div class="field">
+        <label>Запрос</label>
+        <input type="text" id="f-query" placeholder="свободный текст…">
+      </div>
+      <div class="field">
+        <label>Теги (Enter — добавить)</label>
+        <div class="chips" id="chips-tags">
+          ${state.tags.map((t, i) => chip(t, 'tag', i)).join('')}
+          <input type="text" id="f-tag-input" placeholder="+ новый тег" autocomplete="off">
+        </div>
+      </div>
+      <div class="field">
+        <label>Исключить теги</label>
+        <div class="chips" id="chips-excl">
+          ${state.excludeTags.map((t, i) => chip(t, 'excl', i)).join('')}
+          <input type="text" id="f-excl-input" placeholder="+ исключить" autocomplete="off">
+        </div>
+      </div>
+      ${state.showAuthor ? `
+        <div class="field has-ac">
+          <label>Автор поста</label>
+          <input type="text" id="f-user" placeholder="username" autocomplete="off">
+          <div class="field-hint" id="user-hint"></div>
+        </div>` : ''}
+      ${state.showRating ? `
+        <div class="row">
+          <div class="field">
+            <label>Рейтинг от</label>
+            <input type="number" id="f-min-rating" placeholder="-∞">
+          </div>
+          <div class="field">
+            <label>Рейтинг до</label>
+            <input type="number" id="f-max-rating" placeholder="+∞">
+          </div>
+        </div>` : ''}
+      <div class="field">
+        <label>Сортировка</label>
+        <div class="segmented" id="seg-sort">
+          <button data-v="rating" class="${state.sort === 'rating' ? 'active' : ''}">рейтинг</button>
+          <button data-v="date"   class="${state.sort === 'date'   ? 'active' : ''}">дата</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Флаги</label>
+        <div class="toggles">
+          <label><input type="checkbox" id="f-nsfw"> Показывать NSFW</label>
+          <label><input type="checkbox" id="f-only-nsfw"> Только NSFW</label>
+          <label><input type="checkbox" id="f-unsafe"> Показывать unsafe</label>
+          <label class="${state.user ? '' : 'disabled'}">
+            <input type="checkbox" id="f-favorite" ${state.user ? '' : 'disabled'}> Только избранное
+          </label>
+          <label class="full ${state.user ? '' : 'disabled'}" title="${state.user ? `Исключить ${state.blockedCount} тег(а/ов) из твоего профиля` : 'нужен логин'}">
+            <input type="checkbox" id="f-use-blocked" ${state.user ? '' : 'disabled'}>
+            Учитывать заблокированные теги${state.user && state.blockedCount > 0 ? ` <span class="muted">(${state.blockedCount})</span>` : ''}
+          </label>
+        </div>
+      </div>
+      <div class="actions-row search-actions">
+        <button class="btn primary big" id="btn-search" ${state.searching ? 'disabled' : ''}>
+          ${state.searching ? 'Ищу…' : '🔍 Найти'}
+        </button>
+        ${renderAddButton()}
+        ${renderFoundCount()}
+      </div>
+    </div>`;
+}
+
+// renderFoundCount — JR's `Query.search` doesn't accept a media-type
+// argument, so res.PostPager.Count is always the unfiltered total. When
+// the local "тип медиа" toggle is active that number can wildly overshoot
+// what the user will actually see, so flag the label explicitly.
+function renderFoundCount() {
+  if (state.count === null) return '';
+  const totalStr = `${state.count}${state.count >= 1000 ? '+' : ''}`;
+  if (state.kinds.length > 0) {
+    return `<span class="muted" title="JoyReactor не умеет фильтровать по типу медиа на сервере — это общее число постов в поиске. Тип отбирается уже в приложении, см. «Превью» ниже.">
+      Всего по поиску: <strong class="ink">${totalStr}</strong>
+      <span class="muted-inline">(тип фильтрую локально)</span>
+    </span>`;
+  }
+  return `<span class="muted">Найдено: <strong class="ink">${totalStr}</strong></span>`;
+}
+
+// renderAddButton — the "＋ Добавить в очередь" action sits next to "Найти"
+// in the same row so the two primary buttons read side-by-side. In manual
+// mode the label switches to "Добавить выбранные (N)" with a "Сброс" sibling.
+function renderAddButton() {
+  const selectedN = state.manualSelect ? state.selectedPosts.size : 0;
+  if (selectedN > 0) {
+    return `
+      <button class="btn primary big" id="btn-add" title="Скачать только выбранные посты">＋ Добавить выбранные (${selectedN})</button>
+      <button class="btn small" id="btn-clear-selection" title="Снять выделение со всех плиток">Сброс</button>`;
+  }
+  return `<button class="btn primary big" id="btn-add">＋ Добавить в очередь</button>`;
+}
+
+function renderSettingsModal() {
+  const kindChecked = k => state.kinds.includes(k) ? 'checked' : '';
+  return `
+    <div class="modal-backdrop" id="settings-backdrop">
+      <div class="modal wide" id="settings-modal">
+        <div class="modal-header">
+          <h3>Настройки скачивания</h3>
+          <button class="icon-btn" id="btn-settings-close" title="Закрыть">✕</button>
+        </div>
+
+        <div class="settings-section">
+          <h4>Окно</h4>
+          <div class="row">
+            <div class="field">
+              <label>Ширина (px)</label>
+              <input type="number" id="s-win-w" min="600" max="9999" value="${state.windowSettings.width}" ${state.windowSettings.maximized ? 'disabled' : ''}>
+            </div>
+            <div class="field">
+              <label>Высота (px)</label>
+              <input type="number" id="s-win-h" min="400" max="9999" value="${state.windowSettings.height}" ${state.windowSettings.maximized ? 'disabled' : ''}>
+            </div>
+          </div>
+          <div class="toggles">
+            <label>
+              <input type="checkbox" id="s-win-max" ${state.windowSettings.maximized ? 'checked' : ''}>
+              Развернуть на весь доступный экран (с панелью задач)
+            </label>
+          </div>
+          <div class="field-hint">При включении окно растянется на всё рабочее пространство, но не перекроет панель задач Windows. Ширина/высота сохранятся для случая, когда галку снимут.</div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Манифест дедупликации</h4>
+          <div class="manifest-mode">
+            <label>
+              <input type="radio" name="manifest-mode" value="per-folder" ${state.appSettings.manifestMode === 'per-folder' ? 'checked' : ''}>
+              <span>
+                <strong>В каждой папке</strong>
+                <code class="muted">&lt;outDir&gt;/.manifest.json</code>
+              </span>
+            </label>
+            <label>
+              <input type="radio" name="manifest-mode" value="global" ${state.appSettings.manifestMode === 'global' ? 'checked' : ''}>
+              <span>
+                <strong>Общий для всех папок</strong>
+                <code class="muted">%APPDATA%/joyreactorDownloader/manifest.json</code>
+              </span>
+            </label>
+          </div>
+          <div class="field-hint">
+            В режиме «общий» одна и та же картинка не качается повторно, даже
+            если выбрана другая папка для скачивания. Удобно если ты не
+            хочешь дубликатов на диске между разными подборками. Переключение
+            влияет только на новые задачи — уже запущенные продолжают со своим
+            манифестом.
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Какие фильтры показывать</h4>
+          <div class="toggles">
+            <label>
+              <input type="checkbox" id="s-show-author" ${state.showAuthor ? 'checked' : ''}>
+              Поиск по автору
+            </label>
+            <label>
+              <input type="checkbox" id="s-show-rating" ${state.showRating ? 'checked' : ''}>
+              Поиск по рейтингу
+            </label>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Превью</h4>
+          <div class="field">
+            <label>Постов за один клик «Найти» / «Загрузить ещё»</label>
+            <input type="number" id="s-preview-batch" min="1" max="500" value="${state.previewBatch}">
+            <div class="field-hint">JR отдаёт ~10 постов за страницу — мы автоматически дотягиваем нужное количество, делая столько запросов, сколько надо.</div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Тип медиа</h4>
+          <div class="kind-checks">
+            <label><input type="checkbox" id="s-kind-image" ${kindChecked('image')}> Картинки</label>
+            <label><input type="checkbox" id="s-kind-gif"   ${kindChecked('gif')}> GIF</label>
+            <label><input type="checkbox" id="s-kind-video" ${kindChecked('video')}> Видео</label>
+          </div>
+          <div class="field-hint">Ничего не отмечено — качаем все типы.</div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Ограничения</h4>
+          <div class="row">
+            <div class="field">
+              <label>Мин. ширина (px)</label>
+              <input type="number" id="f-min-width" placeholder="0">
+            </div>
+            <div class="field">
+              <label>Мин. высота (px)</label>
+              <input type="number" id="f-min-height" placeholder="0">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Дата с</label>
+              <input type="date" id="f-from">
+            </div>
+            <div class="field">
+              <label>Дата по</label>
+              <input type="date" id="f-to">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Лимит файлов</label>
+              <input type="number" id="f-limit" placeholder="0 = без лимита">
+            </div>
+            <div class="field">
+              <label>Параллельных загрузок</label>
+              <input type="number" id="f-workers" value="4" min="1" max="16">
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Формат имени файла</h4>
+          <div class="filename-fmt">
+            <label>
+              <input type="radio" name="filename-fmt" value="id" ${state.filenameFormat === 'id' ? 'checked' : ''}>
+              <span>
+                <strong>По ID</strong>
+                <code class="muted">12345_67890.jpg</code>
+              </span>
+            </label>
+            <label>
+              <input type="radio" name="filename-fmt" value="tags" ${state.filenameFormat === 'tags' ? 'checked' : ''}>
+              <span>
+                <strong>По тегам (в скобках)</strong>
+                <code class="muted">[art][cat][dog]_12345_67890.jpg</code>
+              </span>
+            </label>
+          </div>
+          <div class="field-hint">Теги сортируются алфавитно (одинаковый пост → одинаковое имя), берётся до 6 шт. Спецсимволы (<code>/ \ : * ? " &lt; &gt; |</code>) заменяются на <code>-</code>, скобки внутри тега — на круглые. ID поста и атрибута добавляются хвостом, чтобы файлы не конфликтовали.</div>
+        </div>
+
+        <div class="actions">
+          <button class="btn primary" id="btn-settings-done">Готово</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderQueueModal() {
+  const anyFinished = state.jobs.some(j => isFinished(j.state));
+  const active = countActive();
+  const subtitle = state.jobs.length === 0
+    ? ''
+    : `<span class="muted">· ${state.jobs.length}${active > 0 ? ` · ${active} активны` : ''}</span>`;
+  const body = state.jobs.length === 0
+    ? `<div class="queue-empty">Очередь пуста. Добавь задачу через «＋ Добавить в очередь» вверху.</div>`
+    : `<div class="queue-table-wrap">
+        <table class="queue-table">
+          <thead>
+            <tr>
+              <th class="col-no">№</th>
+              <th class="col-state">Статус</th>
+              <th class="col-name">Имя</th>
+              <th class="col-folder">Папка</th>
+              <th class="col-progress">Прогресс</th>
+              <th class="col-stats">Файлы</th>
+              <th class="col-actions"></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${state.jobs.map(renderJobRow).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  return `
+    <div class="modal-backdrop" id="queue-backdrop">
+      <div class="modal queue-modal">
+        <div class="modal-header">
+          <h3>Очередь ${subtitle}</h3>
+          <div class="queue-modal-actions">
+            ${anyFinished ? `<button class="btn small" id="btn-clear-finished">Очистить готовые</button>` : ''}
+            <button class="icon-btn" id="btn-queue-close" title="Закрыть (Esc)">✕</button>
+          </div>
+        </div>
+        ${body}
+      </div>
+    </div>`;
+}
+
+function renderJobRow(j, i) {
+  const total = j.saved + j.skipped + j.failed;
+  const determinate = j.limit > 0;
+  let pct;
+  if (j.state === 'done') {
+    pct = 100;                                                   // a finished bar always reads "full"
+  } else if (determinate) {
+    pct = Math.min(100, Math.round((total / j.limit) * 100));
+  } else {
+    pct = 30;                                                    // placeholder for indeterminate running jobs
+  }
+  const indeterm = !determinate && j.state === 'running';
+  const folder = j.outDir;
+  const folderShort = folder.length > 32 ? '…' + folder.slice(-30) : folder;
+  return `
+    <tr class="job-row job-state-${j.state}" data-id="${escape(j.id)}">
+      <td class="col-no">${i + 1}</td>
+      <td class="col-state">
+        <span class="job-badge job-state-${j.state}">${jobStateLabel(j.state)}</span>
+      </td>
+      <td class="col-name" title="${escape(j.name)}">
+        <div class="job-name-cell">${escape(j.name)}</div>
+        ${j.error ? `<div class="job-error-inline" title="${escape(j.error)}">${escape(j.error)}</div>` : ''}
+      </td>
+      <td class="col-folder" title="${escape(folder)}">${escape(folderShort)}</td>
+      <td class="col-progress">
+        <div class="progress-bar mini ${indeterm ? 'indeterminate' : ''} ${j.state === 'paused' ? 'paused' : ''} ${j.state === 'error' ? 'error' : ''}">
+          <div class="fill" style="width: ${pct}%"></div>
+        </div>
+      </td>
+      <td class="col-stats">
+        ${renderJobStats(j, determinate)}
+      </td>
+      <td class="col-actions">${jobButtons(j)}</td>
+    </tr>`;
+}
+
+// renderJobStats — files-column markup. Earlier `saved/skipped` slash-format
+// read as a fraction ("9/0 из 9" looked like "9 of 0 of 9"). New format
+// shows non-zero counts only, with explicit icons + tooltips, so a clean
+// run reads simply "9 из 9" instead of "9/0 из 9".
+function renderJobStats(j, determinate) {
+  const parts = [];
+  if (j.saved   > 0) parts.push(`<span class="stat saved"   title="скачано: ${j.saved}">${j.saved}<span class="stat-icon">✓</span></span>`);
+  if (j.skipped > 0) parts.push(`<span class="stat skipped" title="пропущено (есть в манифесте): ${j.skipped}">${j.skipped}<span class="stat-icon">⊘</span></span>`);
+  if (j.failed  > 0) parts.push(`<span class="stat failed"  title="ошибок: ${j.failed}">${j.failed}<span class="stat-icon">✖</span></span>`);
+  const body = parts.length ? parts.join(' ') : `<span class="stat muted">0</span>`;
+  const totalSuffix = determinate ? ` <span class="muted">из ${j.limit}</span>` : '';
+  return body + totalSuffix;
+}
+
+function jobButtons(j) {
+  const btn = (act, label, title, cls = '') =>
+    `<button class="icon-btn ${cls}" data-act="${act}" data-id="${escape(j.id)}" title="${title}">${label}</button>`;
+  if (j.state === 'running')  return btn('pause',  '⏸', 'Пауза') + btn('cancel', '⏹', 'Отменить', 'danger');
+  if (j.state === 'paused')   return btn('resume', '▶', 'Продолжить') + btn('cancel', '⏹', 'Отменить', 'danger');
+  return btn('open', '📂', 'Открыть папку') + btn('remove', '✕', 'Убрать из списка');
+}
+
+function jobStateLabel(s) {
+  switch (s) {
+    case 'running':  return '⏵ идёт';
+    case 'paused':   return '⏸ пауза';
+    case 'done':     return '✓ готово';
+    case 'error':    return '✖ ошибка';
+    case 'canceled': return '⊘ отменено';
+    default:         return s;
+  }
+}
+
+function isFinished(s) {
+  return s === 'done' || s === 'error' || s === 'canceled';
+}
+
+function renderPreviewCard() {
+  const hasResults = state.results.length > 0;
+  const hasMore = state.count != null && state.results.length < state.count;
+  const header = hasResults
+    ? `Превью: ${state.results.length}${state.count != null ? ` из ${state.count}${state.count >= 1000 ? '+' : ''}` : ''}`
+    : 'Превью';
+  let body;
+  if (hasResults) {
+    body = `<div class="results-grid">${state.results.map(renderTile).join('')}</div>`;
+  } else if (state.searching) {
+    body = `<div class="preview-empty">Ищу…</div>`;
+  } else {
+    body = `<div class="preview-empty">Настрой фильтры справа и нажми <strong>«Найти»</strong>, чтобы увидеть превью.</div>`;
+  }
+  return `
+    <div class="card results preview-card">
+      <div class="results-header">
+        <h2>${header}</h2>
+        <label class="manual-select-toggle" title="Показать чекбоксы на плитках, чтобы скачать только выбранные">
+          <input type="checkbox" id="s-manual-select" ${state.manualSelect ? 'checked' : ''}>
+          <span>Ручное скачивание${state.manualSelect && state.selectedPosts.size > 0 ? ` <span class="muted">(выбрано ${state.selectedPosts.size})</span>` : ''}</span>
+        </label>
+      </div>
+      <div class="preview-scroll">
+        ${body}
+        ${hasMore ? `
+          <div class="actions-row preview-more">
+            <button class="btn" id="btn-more" ${state.searching ? 'disabled' : ''}>
+              ${state.searching ? 'Загружаю…' : 'Загрузить ещё'}
+            </button>
+          </div>` : ''}
+      </div>
+    </div>`;
+}
+
+function renderTile(p) {
+  const thumb = p.thumbnailUrl || (p.pictures?.[0]?.url) || '';
+  const ratingStr = (Math.round(p.rating * 10) / 10).toFixed(1);
+  const picCount = (p.pictures || []).length;
+  const tags = (p.tags || []).slice(0, 4).map(t => escape(t)).join(', ');
+  const kind = postKindLabel(p);
+  const have = tileDownloadState(p);
+  const selected = state.manualSelect && state.selectedPosts.has(p.postId);
+  const fullyDownloaded = have === 'full';
+  const haveBadge = have === 'full'
+    ? `<div class="tile-badge tile-have" title="все картинки поста уже скачаны в текущую папку">✓</div>`
+    : have === 'partial'
+      ? `<div class="tile-badge tile-have partial" title="часть картинок поста уже скачаны">✓</div>`
+      : '';
+  const countBadge = picCount > 1
+    ? `<div class="tile-badge tile-count" title="${picCount} картинок в посте">${picCount}</div>`
+    : '';
+  const nsfwBadge = p.nsfw ? `<div class="tile-badge tile-nsfw">NSFW</div>` : '';
+  const kindBadge = kind  ? `<div class="tile-badge tile-kind">${kind}</div>`  : '';
+  // tile-select appears only when "Ручное скачивание" is on AND the post
+  // isn't already fully downloaded. The left-corner green check already
+  // signals "downloaded", so hiding the right-corner checkbox keeps the UI
+  // uncluttered. stopPropagation in the handler keeps the tile body's
+  // open-preview click from firing.
+  const selectBtn = (state.manualSelect && !fullyDownloaded)
+    ? `<button class="tile-select ${selected ? 'on' : ''}"
+              data-post-id="${escape(p.postId)}"
+              title="${selected ? 'Убрать из выбора' : 'Добавить в выбранные'}"
+              aria-pressed="${selected ? 'true' : 'false'}">${selected ? '✓' : ''}</button>`
+    : '';
+  return `
+    <div class="tile ${selected ? 'selected' : ''}" data-post="${p.postNum}" data-post-id="${escape(p.postId)}" title="${escape(tags)}">
+      ${thumb ? `<img src="${escape(thumb)}" loading="lazy" alt="" draggable="false">` : '<div class="tile-empty">нет превью</div>'}
+      <div class="tile-corner left">
+        ${haveBadge}
+        ${countBadge}
+      </div>
+      <div class="tile-corner right">
+        ${selectBtn}
+        ${nsfwBadge}
+        ${kindBadge}
+      </div>
+      <div class="tile-meta">
+        <span class="tile-rating">★ ${ratingStr}</span>
+        <span class="tile-author">${escape(p.author || '')}</span>
+      </div>
+    </div>`;
+}
+
+// tileDownloadState — '' / 'partial' / 'full' depending on how many of the
+// post's pictures are in the current outdir's manifest. "full" is solid green
+// (definitively already have it), "partial" is faded green (got some, not all).
+function tileDownloadState(p) {
+  const set = state.downloaded.keys;
+  const pics = p.pictures || [];
+  if (set.size === 0 || pics.length === 0) return '';
+  let n = 0;
+  for (const pic of pics) if (set.has(pic.attrId)) n++;
+  if (n === 0) return '';
+  return n === pics.length ? 'full' : 'partial';
+}
+
+// postKindLabel reports the strongest media kind in the post for the corner
+// badge. Returns '' only for posts with no pictures at all — every other
+// post gets IMG/GIF/VIDEO so the user can tell at a glance what's inside.
+function postKindLabel(p) {
+  const pics = p.pictures || [];
+  if (pics.length === 0) return '';
+  if (pics.some(x => x.kind === 'video')) return 'VIDEO';
+  if (pics.some(x => x.kind === 'gif')) return 'GIF';
+  return 'IMG';
+}
+
+function renderPostPreview() {
+  const m = state.postModal;
+  const p = m.post;
+  const ratingStr = (Math.round(p.rating * 10) / 10).toFixed(1);
+  // Tag pills in the overlay: click to toggle membership in state.tags.
+  // Active (already-in-search) pills get the accent colour; clicking them
+  // removes the tag from the chip list.
+  const activeTags = new Set(state.tags || []);
+  const tagsLine = (p.tags || []).map(t => {
+    const isActive = activeTags.has(t);
+    const cls = isActive ? 'post-overlay-tag active' : 'post-overlay-tag';
+    const title = isActive ? `убрать «${t}» из поиска` : `добавить «${t}» в поиск`;
+    return `<span class="${cls}" data-tag="${escape(t)}" title="${escape(title)}">${escape(t)}</span>`;
+  }).join('');
+
+  const pics = (p.pictures || []).length
+    ? p.pictures.map(pic => mediaTile(pic, 'post-overlay-pic', { postId: p.postId, tags: p.tags })).join('')
+    : '<div class="post-overlay-empty">В посте нет картинок</div>';
+
+  let commentsBody;
+  if (m.loading)      commentsBody = `<div class="comments-empty">Загружаю комментарии…</div>`;
+  else if (m.error)   commentsBody = `<div class="comments-empty err">${escape(m.error)}</div>`;
+  else if (!m.comments || m.comments.length === 0) commentsBody = `<div class="comments-empty">Комментариев нет.</div>`;
+  else                commentsBody = m.comments.map(renderComment).join('');
+
+  const commentsHeader = m.loading
+    ? 'Комментарии'
+    : `Комментарии · ${m.comments ? m.comments.length : 0}`;
+
+  return `
+    <div class="post-overlay" id="post-overlay-backdrop">
+      <div class="post-overlay-inner">
+        <button class="icon-btn post-overlay-close" id="btn-post-close" title="Закрыть (Esc)">✕</button>
+        <div class="post-overlay-pics">
+          <div class="post-overlay-meta">
+            <div class="post-overlay-meta-info">
+              <span class="tile-rating">★ ${ratingStr}</span>
+              ${p.author ? `<span class="post-overlay-author">@${escape(p.author)}</span>` : ''}
+              ${p.nsfw ? `<span class="tile-badge tile-nsfw">NSFW</span>` : ''}
+            </div>
+            <div class="post-overlay-meta-actions">
+              ${tileDownloadState(p) === 'full'
+                ? `<button class="btn small" id="btn-post-save" disabled title="все картинки этого поста уже в папке">✓ Скачано</button>`
+                : `<button class="btn small primary" id="btn-post-save" title="Скачать только этот пост в текущую папку">＋ Сохранить</button>`}
+              <button class="btn small" id="btn-post-open">Открыть на сайте</button>
+            </div>
+          </div>
+          ${tagsLine ? `<div class="post-overlay-tags">${tagsLine}</div>` : ''}
+          <div class="post-overlay-pics-list">${pics}</div>
+        </div>
+        <div class="post-overlay-comments">
+          <div class="comments-header">${commentsHeader}</div>
+          <div class="comments-list">${commentsBody}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderComment(c) {
+  const indent = Math.min(c.level || 0, 8);
+  const ratingCls = c.rating > 0 ? 'pos' : c.rating < 0 ? 'neg' : '';
+  const ratingStr = c.rating === 0 ? '0' : (c.rating > 0 ? '+' : '') + c.rating.toFixed(1).replace(/\.0$/, '');
+  return `
+    <div class="comment" style="margin-left: ${indent * 14}px">
+      <div class="comment-meta">
+        <span class="comment-author">${escape(c.author || 'аноним')}</span>
+        <span class="comment-rating ${ratingCls}">${ratingStr}</span>
+      </div>
+      <div class="comment-body">${renderCommentBody(c)}</div>
+    </div>`;
+}
+
+// renderCommentBody turns JR's comment.text (HTML with &attribute_insert_N&
+// placeholders) plus the attribute list into safe markup. Each placeholder
+// is swapped for the matching attribute's image; text segments are sanitized
+// (whitelist of <a>/<br>/<b>/<i>/<em>/<strong>) so links stay clickable but
+// raw <p>/<div>/<script>/etc. don't leak through.
+function renderCommentBody(c) {
+  const text = c.text || '';
+  const pics = c.pictures || [];
+
+  // Lookup: insertId -> picture. Fall back to positional order if multiple
+  // attrs share insertId 0 (rare/legacy).
+  const byInsert = new Map();
+  pics.forEach((p, i) => {
+    const key = p.insertId || i + 1;
+    if (!byInsert.has(key)) byInsert.set(key, p);
+  });
+  const usedInserts = new Set();
+
+  // Split on the placeholder, keep the captured insert id.
+  const parts = text.split(/&attribute_insert_(\d+)&/);
+  let html = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 0) {
+      const segment = sanitizeCommentHTML(parts[i]);
+      // Skip purely-empty interstitials (whitespace or just <br>s between
+      // attribute placeholders) — without this the comment renders with
+      // blank gaps between every embedded image.
+      if (segmentHasContent(parts[i], segment)) {
+        html += `<div class="comment-text">${segment}</div>`;
+      }
+    } else {
+      const id = parseInt(parts[i], 10);
+      usedInserts.add(id);
+      const pic = byInsert.get(id);
+      if (pic) html += commentPicMarkup(pic);
+      else      html += `<div class="comment-text muted">[вложение #${id} не получено]</div>`;
+    }
+  }
+
+  // Append any attributes the text didn't reference (legacy comments where
+  // the placeholder is missing). Without this we'd drop their images on the floor.
+  for (const pic of pics) {
+    const key = pic.insertId || 0;
+    if (key && usedInserts.has(key)) continue;
+    if (!key) html += commentPicMarkup(pic);
+  }
+  return html || `<div class="comment-text muted">(пусто)</div>`;
+}
+
+function commentPicMarkup(pic) {
+  return mediaTile(pic, 'comment-pic post-overlay-pic');
+}
+
+// mediaTile renders one picture/video for the overlay or a comment body.
+// MP4/WEBM go into a <video> with native controls — we deliberately don't
+// wire BrowserOpenURL on the wrapper for videos so play/pause/seek aren't
+// hijacked. Images keep click-to-open in browser.
+function mediaTile(pic, cssClass, meta) {
+  // JR's CDN refuses to serve newer media without a joyreactor.cc Referer,
+  // and the WebView sends its own (wails://) origin. Route every src through
+  // our Go-side /proxy, which adds the right Referer. data-url stays the
+  // direct CDN url so "open in browser" hands the user the canonical link.
+  //
+  // meta carries the parent post's id + tags so the proxy can build a
+  // "Save image as" filename matching state.filenameFormat. Comments are
+  // currently rendered without meta; the proxy then falls back to the URL
+  // segment as the filename hint.
+  const imgUrl   = pic.url || '';
+  const videoUrl = pic.videoUrl || '';
+  const hint     = namingHint(pic, meta);
+  const imgSrc   = proxyURL(imgUrl,   hint);
+  const videoSrc = proxyURL(videoUrl, hint);
+
+  // Matches joyreactor.cc — every <video> renders without controls,
+  // autoplay-looping muted like a giant gif. Click toggles play/pause; the ↗
+  // button opens the original in the system browser for sound/seek.
+  // "real video" (kind === 'video') and "gif-as-video" (kind === 'gif' with a
+  // transcoded videoUrl) only differ in which URL we feed to <video src>.
+  const isRealVideo  = pic.kind === 'video';
+  const isGifAsVideo = !isRealVideo && !!videoUrl;
+
+  if (isRealVideo || isGifAsVideo) {
+    const src     = isGifAsVideo ? videoSrc : imgSrc;
+    const openUrl = isGifAsVideo ? videoUrl : imgUrl;
+    // For gif-as-video we stash the original .gif on the wrapper so a 404 on
+    // the webm transcode can degrade gracefully to the gif instead of an
+    // error message. (Our webm URL guesses the post's primary tag-slug; when
+    // wrong, JR returns 404 and the <video> emits an error event.)
+    const fallbackAttrs = isGifAsVideo
+      ? ` data-gif-fallback-src="${escape(imgSrc)}" data-gif-fallback-url="${escape(imgUrl)}"`
+      : '';
+    return `
+      <div class="${cssClass} is-video is-gif-video"${fallbackAttrs}>
+        <video src="${escape(src)}" autoplay loop muted playsinline preload="metadata"></video>
+        <button class="media-open-btn" data-url="${escape(openUrl)}" title="Открыть оригинал в браузере">↗</button>
+      </div>`;
+  }
+  return `
+    <div class="${cssClass}" data-url="${escape(imgUrl)}" title="Открыть оригинал в браузере">
+      <img src="${escape(imgSrc)}" alt="" loading="lazy">
+    </div>`;
+}
+
+// proxyURL wraps a joyreactor.cc CDN URL so the WebView fetches it via our
+// Go-side proxy (which adds the Referer JR requires). Empty in → empty out.
+//
+// When `hint` is supplied (pid/aid/type/tags), the proxy uses it together
+// with state.filenameFormat to set Content-Disposition. That's what makes
+// WebView2's "Save image as" suggest the same filename the downloader
+// would write to disk.
+function proxyURL(jrUrl, hint) {
+  if (!jrUrl) return '';
+  if (!hint || !hint.pid || !hint.aid || !hint.type) {
+    return '/proxy?url=' + encodeURIComponent(jrUrl);
+  }
+  const p = new URLSearchParams();
+  p.set('url', jrUrl);
+  p.set('pid', hint.pid);
+  p.set('aid', hint.aid);
+  p.set('type', hint.type);
+  p.set('fmt', state.filenameFormat || 'id');
+  for (const t of hint.tags || []) p.append('tag', t);
+  return '/proxy?' + p.toString();
+}
+
+// namingHint — packs the data the Go-side proxy needs to reconstruct the
+// downloader's filename. Returns null when we don't have a parent post
+// (e.g. when mediaTile is called from a comment without context).
+function namingHint(pic, meta) {
+  if (!meta || !meta.postId || !pic.attrId || !pic.type) return null;
+  return {
+    pid:  meta.postId,
+    aid:  pic.attrId,
+    type: pic.type,
+    tags: meta.tags || [],
+  };
+}
+
+// sanitizeCommentHTML parses raw JR comment HTML into a fresh inert document
+// (so no scripts/images execute) and walks it, keeping only a small tag
+// whitelist. Everything else collapses to its text content; attributes are
+// dropped except for the href on whitelisted links. Anchors keep their URL
+// in a data-url attribute so wireEvents can route the click through
+// BrowserOpenURL instead of letting the WebView navigate away from the app.
+const COMMENT_TAG_WHITELIST = new Set(['A', 'BR', 'B', 'I', 'EM', 'STRONG']);
+
+function sanitizeCommentHTML(raw) {
+  if (!raw) return '';
+  const doc = new DOMParser().parseFromString('<div>' + String(raw) + '</div>', 'text/html');
+  const wrap = doc.body && doc.body.firstChild;
+  if (!wrap) return '';
+  return sanitizeChildren(wrap);
+}
+
+function sanitizeNode(node) {
+  if (node.nodeType === 3 /* TEXT_NODE */) {
+    return escape(node.nodeValue || '');
+  }
+  if (node.nodeType !== 1 /* ELEMENT_NODE */) return '';
+  const tag = node.tagName;
+  if (!COMMENT_TAG_WHITELIST.has(tag)) return sanitizeChildren(node);
+  if (tag === 'BR') return '<br>';
+  if (tag === 'A') {
+    const href = node.getAttribute('href') || '';
+    if (/^https?:\/\//i.test(href)) {
+      return '<a class="comment-link" data-url="' + escape(href) + '">' + sanitizeChildren(node) + '</a>';
+    }
+    return sanitizeChildren(node);
+  }
+  const t = tag.toLowerCase();
+  return '<' + t + '>' + sanitizeChildren(node) + '</' + t + '>';
+}
+
+function sanitizeChildren(node) {
+  let out = '';
+  for (const c of node.childNodes) out += sanitizeNode(c);
+  return out;
+}
+
+// segmentHasContent reports whether a between-placeholders text segment is
+// worth rendering. Empty strings, pure whitespace, or HTML containing only
+// <br>s should not produce an empty bubble — that just adds vertical gaps.
+function segmentHasContent(raw, sanitized) {
+  if (raw.replace(/<[^>]+>/g, '').trim() !== '') return true;
+  return /<a\s/i.test(sanitized);
+}
+
+function countActive() {
+  return state.jobs.filter(j => j.state === 'running' || j.state === 'paused').length;
+}
+
+function chip(text, kind, i) {
+  return `<span class="chip">${escape(text)}<button data-kind="${kind}" data-i="${i}" title="убрать">×</button></span>`;
+}
+
+// ----- Input preservation across re-renders -----
+// All known input ids — only those present in the current DOM are captured/restored.
+const inputIds = ['f-query','f-user','f-min-rating','f-max-rating','f-nsfw','f-only-nsfw','f-unsafe','f-favorite','f-use-blocked','f-min-width','f-min-height','f-from','f-to','f-limit','f-workers','f-outdir'];
+
+function captureInputs() {
+  for (const id of inputIds) {
+    const el = $('#' + id);
+    if (!el) continue;
+    state.formInputs[id] = (el.type === 'checkbox') ? el.checked : el.value;
+  }
+}
+
+function restoreInputs() {
+  for (const id of inputIds) {
+    const el = $('#' + id);
+    const v = state.formInputs[id];
+    if (!el || v === undefined) continue;
+    if (el.type === 'checkbox') el.checked = !!v;
+    else el.value = v;
+  }
+}
+
+// ----- Event wiring -----
+function wireEvents() {
+  $('#btn-login')?.addEventListener('click', openLogin);
+  $('#btn-logout')?.addEventListener('click', doLogout);
+  $('#btn-search')?.addEventListener('click', () => doSearch(true));
+  $('#btn-more')?.addEventListener('click', () => doSearch(false));
+  $('#btn-add')?.addEventListener('click', doAddJob);
+  $('#btn-pick')?.addEventListener('click', doPickFolder);
+  $('#btn-open-outdir')?.addEventListener('click', doOpenCurrentOutdir);
+  $('#f-outdir')?.addEventListener('change', async e => {
+    const v = e.target.value.trim();
+    state.formInputs['f-outdir'] = v;
+    if (v) localStorage.setItem(LS_OUTDIR, v);
+    syncOutdirToPreset();
+    await refreshDownloadedKeys();
+    render({ skipCapture: true });
+  });
+  $('#btn-clear-finished')?.addEventListener('click', doClearFinished);
+  $('#btn-settings')?.addEventListener('click', openSettings);
+  $('#btn-settings-close')?.addEventListener('click', closeSettings);
+  $('#btn-settings-done')?.addEventListener('click', closeSettings);
+  $('#settings-backdrop')?.addEventListener('click', e => {
+    if (e.target.id === 'settings-backdrop') closeSettings();
+  });
+
+  $('#btn-queue')?.addEventListener('click', openQueue);
+  $('#btn-queue-close')?.addEventListener('click', closeQueue);
+  $('#queue-backdrop')?.addEventListener('click', e => {
+    if (e.target.id === 'queue-backdrop') closeQueue();
+  });
+
+
+  $('#preset-sel')?.addEventListener('change', e => applyPreset(e.target.value));
+  $('#btn-preset-save')?.addEventListener('click', doSavePreset);
+  $('#btn-preset-delete')?.addEventListener('click', doDeletePreset);
+
+  $('#s-show-author')?.addEventListener('change', e => {
+    state.showAuthor = e.target.checked;
+    localStorage.setItem(LS_SHOW_AUTHOR, e.target.checked ? '1' : '0');
+    captureInputs();
+    render();
+  });
+  $('#s-show-rating')?.addEventListener('change', e => {
+    state.showRating = e.target.checked;
+    localStorage.setItem(LS_SHOW_RATING, e.target.checked ? '1' : '0');
+    captureInputs();
+    render();
+  });
+  $('#s-preview-batch')?.addEventListener('change', e => {
+    const n = parseInt(e.target.value, 10);
+    if (Number.isFinite(n) && n > 0) {
+      state.previewBatch = Math.min(n, 500);
+      localStorage.setItem(LS_PREVIEW_BATCH, String(state.previewBatch));
+    }
+  });
+
+  const winW = $('#s-win-w'), winH = $('#s-win-h'), winMax = $('#s-win-max');
+  const pushWinSettings = () => {
+    SaveWindowSettings({
+      width:     state.windowSettings.width,
+      height:    state.windowSettings.height,
+      maximized: state.windowSettings.maximized,
+    });
+  };
+  winW?.addEventListener('change', e => {
+    const n = parseInt(e.target.value, 10);
+    if (Number.isFinite(n) && n >= 600) {
+      state.windowSettings.width = n;
+      pushWinSettings();
+    }
+  });
+  winH?.addEventListener('change', e => {
+    const n = parseInt(e.target.value, 10);
+    if (Number.isFinite(n) && n >= 400) {
+      state.windowSettings.height = n;
+      pushWinSettings();
+    }
+  });
+  winMax?.addEventListener('change', e => {
+    state.windowSettings.maximized = e.target.checked;
+    pushWinSettings();
+    // Re-render so the W/H inputs get disabled/enabled to match.
+    captureInputs();
+    render();
+  });
+
+  for (const k of ['image','gif','video']) {
+    $('#s-kind-' + k)?.addEventListener('change', e => {
+      const has = state.kinds.includes(k);
+      if (e.target.checked && !has) state.kinds.push(k);
+      else if (!e.target.checked && has) state.kinds = state.kinds.filter(x => x !== k);
+    });
+  }
+
+  $$('input[name="filename-fmt"]').forEach(r => {
+    r.addEventListener('change', e => {
+      state.filenameFormat = e.target.value;
+      localStorage.setItem(LS_FILENAME_FORMAT, e.target.value);
+    });
+  });
+
+  $$('input[name="manifest-mode"]').forEach(r => {
+    r.addEventListener('change', async e => {
+      const mode = e.target.value;
+      state.appSettings.manifestMode = mode;
+      const err = await SaveAppSettings({ manifestMode: mode });
+      if (err) {
+        showToast('error', `Не удалось сохранить: ${err}`);
+        return;
+      }
+      // The set of "already downloaded" tiles depends on which manifest
+      // is consulted — refresh the badge cache after switching modes so
+      // the grid updates immediately.
+      await refreshDownloadedKeys();
+      render({ skipCapture: true });
+    });
+  });
+
+  attachAutocomplete($('#f-tag-input'), TagSuggest, name => {
+    if (!state.tags.includes(name)) state.tags.push(name);
+    captureInputs();
+    render();
+  });
+  attachAutocomplete($('#f-excl-input'), TagSuggest, name => {
+    if (!state.excludeTags.includes(name)) state.excludeTags.push(name);
+    captureInputs();
+    render();
+  });
+  if (state.showAuthor) {
+    attachAutocomplete(
+      $('#f-user'),
+      async mask => (await SuggestUsers(mask) || []).map(n => ({ name: n })),
+      name => {
+        const el = $('#f-user');
+        if (el) { el.value = name; state.formInputs['f-user'] = name; el.dispatchEvent(new Event('input')); }
+      },
+      { clearOnPick: false, minMaskLen: 1 },
+    );
+    attachUserValidation($('#f-user'), $('#user-hint'));
+  }
+
+  $$('#chips-tags .chip button, #chips-excl .chip button').forEach(b => {
+    b.addEventListener('click', () => {
+      const kind = b.dataset.kind === 'tag' ? 'tags' : 'excludeTags';
+      state[kind].splice(parseInt(b.dataset.i, 10), 1);
+      captureInputs();
+      render();
+    });
+  });
+
+  $$('#seg-sort button').forEach(b => b.addEventListener('click', () => { state.sort = b.dataset.v; captureInputs(); render(); }));
+
+  $$('.tile[data-post]').forEach(t => {
+    t.addEventListener('click', e => {
+      // The tile-select checkbox handles its own clicks (with stopPropagation).
+      // Anywhere else on the tile opens the post-preview overlay; from there
+      // the «Открыть на сайте» button takes the user to the real post URL.
+      // Suppress this click if a drag-select gesture just finished — the
+      // user wasn't trying to open a preview.
+      if (dragSuppressClick) {
+        dragSuppressClick = false;
+        return;
+      }
+      if (e.target.closest('.tile-select')) return;
+      const n = t.dataset.post;
+      const post = state.results.find(p => String(p.postNum) === n);
+      if (post) openPostPreview(post);
+    });
+  });
+  attachGridDragSelect();
+  $$('.tile-select[data-post-id]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const id = btn.dataset.postId;
+      if (!id) return;
+      if (state.selectedPosts.has(id)) state.selectedPosts.delete(id);
+      else                              state.selectedPosts.add(id);
+      render({ skipCapture: true });
+    });
+  });
+  $('#btn-clear-selection')?.addEventListener('click', () => {
+    state.selectedPosts.clear();
+    render({ skipCapture: true });
+  });
+  $('#s-manual-select')?.addEventListener('change', e => {
+    state.manualSelect = e.target.checked;
+    localStorage.setItem(LS_MANUAL_SELECT, e.target.checked ? '1' : '0');
+    // Turning manual mode off shouldn't leave a stale selection running the
+    // next "Добавить в очередь" through the selected-items code path.
+    if (!state.manualSelect) state.selectedPosts.clear();
+    render({ skipCapture: true });
+  });
+
+  // Post-preview overlay (right-click on a tile)
+  $('#btn-post-close')?.addEventListener('click', closePostPreview);
+  $('#post-overlay-backdrop')?.addEventListener('click', e => {
+    if (e.target.id === 'post-overlay-backdrop') closePostPreview();
+  });
+  $('#btn-post-open')?.addEventListener('click', () => {
+    const n = state.postModal?.post?.postNum;
+    if (n) BrowserOpenURL(`https://joyreactor.cc/post/${n}`);
+  });
+  $('#btn-post-save')?.addEventListener('click', () => doSaveCurrentPost());
+  // Tag pills inside the post overlay: click to toggle membership in
+  // state.tags. Active pills (already in the chip list) get removed;
+  // inactive ones get added. Re-renders the shell so both the chip and
+  // the pill flip immediately.
+  $$('.post-overlay-tag[data-tag]').forEach(el => {
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      const name = el.dataset.tag;
+      if (!name) return;
+      const i = state.tags.indexOf(name);
+      if (i >= 0) state.tags.splice(i, 1);
+      else        state.tags.push(name);
+      render({ skipCapture: true });
+    });
+  });
+  $$('.post-overlay-pic[data-url]').forEach(el => {
+    el.addEventListener('click', () => {
+      const u = el.dataset.url;
+      if (u) BrowserOpenURL(u);
+    });
+  });
+  $$('.media-open-btn[data-url]').forEach(b => {
+    b.addEventListener('click', e => {
+      e.stopPropagation();
+      const u = b.dataset.url;
+      if (u) BrowserOpenURL(u);
+    });
+  });
+  // Comment links: send through the system browser instead of letting the
+  // WebView navigate away from the app shell.
+  $$('.comment-link[data-url]').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const u = a.dataset.url;
+      if (u) BrowserOpenURL(u);
+    });
+  });
+  // Gif-as-video has no native controls. Click toggles play/pause so users can
+  // freeze an interesting frame the way they would on joyreactor.cc itself.
+  $$('.is-gif-video video').forEach(v => {
+    v.addEventListener('click', () => {
+      if (v.paused) v.play(); else v.pause();
+    });
+  });
+  // Surface load failures inline — when the URL pattern is wrong or the
+  // codec isn't supported, this is the only way for the user to see what
+  // happened (no devtools in the shipped WebView). For gif-as-video the
+  // wrapper carries the original .gif as a fallback; on error we swap to
+  // <img> so the user still sees the animation.
+  $$('.is-video video').forEach(v => {
+    v.addEventListener('error', () => {
+      const wrap = v.parentElement;
+      if (!wrap) return;
+      const fallbackSrc = wrap.dataset.gifFallbackSrc;
+      const fallbackUrl = wrap.dataset.gifFallbackUrl;
+      if (fallbackSrc) {
+        wrap.classList.remove('is-video', 'is-gif-video');
+        wrap.innerHTML = `<img src="${escape(fallbackSrc)}" alt="" loading="lazy">`;
+        if (fallbackUrl) {
+          wrap.dataset.url = fallbackUrl;
+          wrap.style.cursor = 'pointer';
+          wrap.title = 'Открыть оригинал в браузере';
+          wrap.addEventListener('click', () => BrowserOpenURL(fallbackUrl));
+        }
+        return;
+      }
+      const failedUrl = v.currentSrc || v.src;
+      const errCode = v.error ? v.error.code : '?';
+      wrap.innerHTML = `
+        <div class="video-error">
+          Не удалось загрузить видео (code ${escape(errCode)}).
+          <div class="video-error-url" title="нажми, чтобы открыть в браузере">${escape(failedUrl)}</div>
+        </div>`;
+      wrap.querySelector('.video-error-url')?.addEventListener('click', () => {
+        if (failedUrl) BrowserOpenURL(failedUrl);
+      });
+    });
+  });
+
+  $$('.job-row .col-actions button[data-act]').forEach(b => {
+    b.addEventListener('click', () => {
+      const id = b.dataset.id, act = b.dataset.act;
+      if (act === 'pause')   PauseJob(id);
+      if (act === 'resume')  ResumeJob(id);
+      if (act === 'cancel')  CancelJob(id);
+      if (act === 'remove')  doRemoveJob(id);
+      if (act === 'open')    doOpenJobFolder(id);
+    });
+  });
+}
+
+// ----- Drag-select (rubber band marquee) -----
+// In manual-select mode, holding LMB on the grid and dragging draws a
+// rectangle; every preview tile it touches is added to state.selectedPosts
+// (fully-downloaded ones are skipped). Tiles get the .selected class live
+// during the drag; the rest of the UI (Add-selected button label, count
+// indicators) syncs on mouseup via a full render.
+
+let dragState = null;        // { startX, startY, curX, curY, dragging, initial: Set }
+let marqueeEl = null;
+let dragSuppressClick = false;
+
+function attachGridDragSelect() {
+  const grid = $('.results-grid');
+  if (!grid) return;
+  grid.addEventListener('mousedown', onGridMouseDown);
+}
+
+function onGridMouseDown(e) {
+  if (!state.manualSelect) return;
+  if (e.button !== 0) return;
+  // The checkbox handles its own clicks — don't hijack as drag-start.
+  if (e.target.closest('.tile-select')) return;
+  // Suppress the browser's native "drag this image as a file" gesture — it
+  // would attach an image ghost to the cursor and steal our marquee. Safe
+  // here because we already filtered out the checkbox.
+  e.preventDefault();
+  dragState = {
+    startX: e.clientX, startY: e.clientY,
+    curX:   e.clientX, curY:   e.clientY,
+    dragging: false,
+    initial: new Set(state.selectedPosts),    // tiles already selected when drag began stay selected if dragged-off
+  };
+  document.addEventListener('mousemove', onDragMove);
+  document.addEventListener('mouseup',   onDragEnd, { once: true });
+}
+
+function onDragMove(e) {
+  if (!dragState) return;
+  dragState.curX = e.clientX;
+  dragState.curY = e.clientY;
+  if (!dragState.dragging) {
+    const dx = e.clientX - dragState.startX;
+    const dy = e.clientY - dragState.startY;
+    if (Math.hypot(dx, dy) < 6) return;       // movement threshold — distinguishes click from drag
+    dragState.dragging = true;
+    createMarquee();
+    // Make text non-selectable during drag so it doesn't fight the marquee.
+    document.body.classList.add('dragging-select');
+  }
+  updateMarquee();
+  applyDragSelectionLive();
+}
+
+function onDragEnd() {
+  document.removeEventListener('mousemove', onDragMove);
+  const wasDragging = dragState?.dragging === true;
+  destroyMarquee();
+  document.body.classList.remove('dragging-select');
+  dragState = null;
+  if (wasDragging) {
+    dragSuppressClick = true;
+    // Re-render so the preset-bar action button label updates to reflect
+    // the new selection count. Click on a tile right after drag-end is
+    // ignored (see dragSuppressClick check in the tile handler).
+    render({ skipCapture: true });
+  }
+}
+
+function createMarquee() {
+  if (marqueeEl) return;
+  marqueeEl = document.createElement('div');
+  marqueeEl.className = 'marquee';
+  document.body.appendChild(marqueeEl);
+}
+
+function destroyMarquee() {
+  marqueeEl?.remove();
+  marqueeEl = null;
+}
+
+function updateMarquee() {
+  if (!marqueeEl || !dragState) return;
+  const x = Math.min(dragState.startX, dragState.curX);
+  const y = Math.min(dragState.startY, dragState.curY);
+  const w = Math.abs(dragState.curX - dragState.startX);
+  const h = Math.abs(dragState.curY - dragState.startY);
+  marqueeEl.style.left   = x + 'px';
+  marqueeEl.style.top    = y + 'px';
+  marqueeEl.style.width  = w + 'px';
+  marqueeEl.style.height = h + 'px';
+}
+
+// applyDragSelectionLive — mutates state.selectedPosts AND toggles .selected
+// classes on tiles directly, avoiding a full render on every mousemove. The
+// preset-bar's "Добавить выбранные (N)" label is stale until drag-end, which
+// is fine — the live tile highlight is the immediate visual feedback.
+function applyDragSelectionLive() {
+  if (!dragState || !dragState.dragging) return;
+  const x  = Math.min(dragState.startX, dragState.curX);
+  const y  = Math.min(dragState.startY, dragState.curY);
+  const x2 = Math.max(dragState.startX, dragState.curX);
+  const y2 = Math.max(dragState.startY, dragState.curY);
+  for (const t of document.querySelectorAll('.tile[data-post-id]')) {
+    const id = t.dataset.postId;
+    if (!id) continue;
+    const r = t.getBoundingClientRect();
+    const intersects = !(r.right < x || r.left > x2 || r.bottom < y || r.top > y2);
+    if (intersects) {
+      const p = state.results.find(p => p.postId === id);
+      if (p && tileDownloadState(p) !== 'full') state.selectedPosts.add(id);
+    } else if (!dragState.initial.has(id)) {
+      state.selectedPosts.delete(id);          // removed from marquee since drag started — uncheck
+    }
+    const shouldSelect = state.selectedPosts.has(id);
+    t.classList.toggle('selected', shouldSelect);
+    const btn = t.querySelector('.tile-select');
+    if (btn) {
+      btn.classList.toggle('on', shouldSelect);
+      btn.textContent = shouldSelect ? '✓' : '';
+    }
+  }
+}
+
+function openSettings() {
+  captureInputs();
+  state.settingsOpen = true;
+  render();
+}
+
+function closeSettings() {
+  captureInputs();
+  state.settingsOpen = false;
+  render();
+}
+
+function openQueue() {
+  captureInputs();
+  state.queueOpen = true;
+  render();
+}
+
+function closeQueue() {
+  captureInputs();
+  state.queueOpen = false;
+  render();
+}
+
+async function openPostPreview(post) {
+  captureInputs();
+  state.postModal = { post, comments: null, loading: true, error: null };
+  render({ skipCapture: true });
+  let seq = ++openPostPreview.seq;
+  try {
+    const res = await PostComments(post.postId);
+    if (seq !== openPostPreview.seq || !state.postModal) return;
+    if (res.error) state.postModal.error = res.error;
+    else           state.postModal.comments = res.comments || [];
+  } catch (e) {
+    if (seq !== openPostPreview.seq || !state.postModal) return;
+    state.postModal.error = String(e);
+  } finally {
+    if (state.postModal) {
+      state.postModal.loading = false;
+      render({ skipCapture: true });
+    }
+  }
+}
+openPostPreview.seq = 0;
+
+function closePostPreview() {
+  state.postModal = null;
+  openPostPreview.seq++;
+  render({ skipCapture: true });
+}
+
+// ----- Actions -----
+function collectInput(page) {
+  const num = sel => {
+    const v = $(sel)?.value;
+    if (v === '' || v == null) return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  const username = state.showAuthor ? (state.formInputs['f-user'] || $('#f-user')?.value || '') : '';
+  const minRating = state.showRating ? (num('#f-min-rating') ?? parseNullableStored('f-min-rating')) : null;
+  const maxRating = state.showRating ? (num('#f-max-rating') ?? parseNullableStored('f-max-rating')) : null;
+  return {
+    query: $('#f-query')?.value || '',
+    tags: state.tags,
+    excludeTags: state.excludeTags,
+    username,
+    minRating,
+    maxRating,
+    sort: state.sort,
+    showNsfw: $('#f-nsfw')?.checked || false,
+    onlyNsfw: $('#f-only-nsfw')?.checked || false,
+    showUnsafe: $('#f-unsafe')?.checked || false,
+    // Auth-gated filters are visually disabled when logged out, but their
+    // backing state.formInputs values can survive a logout and still read
+    // .checked === true. Force them off without a session.
+    onlyFavorite: state.user ? ($('#f-favorite')?.checked || false) : false,
+    useBlockedTags: state.user ? ($('#f-use-blocked')?.checked || false) : false,
+    page,
+  };
+}
+
+// parseNullableStored reads an int from state.formInputs (used when an input
+// element is currently hidden but the value is still preserved in state).
+function parseNullableStored(id) {
+  const v = state.formInputs[id];
+  if (v === '' || v == null) return null;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseStoredInt(id, def = 0) {
+  return parseNullableStored(id) ?? def;
+}
+
+function dedupPosts(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const p of arr) {
+    const k = p.postId || p.postNum;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(p);
+  }
+  return out;
+}
+
+// filterByKinds drops posts where none of the pictures match the Settings
+// media-kinds toggle. Empty state.kinds means "any" — no-op pass-through.
+function filterByKinds(posts) {
+  if (!state.kinds.length) return posts;
+  const want = new Set(state.kinds);
+  return posts.filter(p => (p.pictures || []).some(pic => want.has(pic.kind)));
+}
+
+function sortResults(arr) {
+  if (state.sort === 'date') {
+    return [...arr].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  }
+  // 'rating' (default)
+  return [...arr].sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+}
+
+async function doSearch(reset) {
+  captureInputs();
+  state.searching = true;
+  hideToast();
+  if (reset) {
+    state.results = [];
+    state.count = null;
+    state.page = 0;
+    // The previously-selected post ids would no longer match any visible
+    // tile, so clear them to avoid invisible selection state.
+    state.selectedPosts.clear();
+  }
+  render();
+
+  const target  = Math.max(1, state.previewBatch || 25);
+  const startLen = state.results.length;
+  const maxPages = 30; // safety cap: avoid runaway loops on weird API responses
+  let   fetched  = 0;
+
+  try {
+    while (state.results.length - startLen < target && fetched < maxPages) {
+      const nextPage = state.page + 1;
+      const res = await Search(collectInput(nextPage));
+      if (res.error) {
+        showToast('error', res.error);
+        break;
+      }
+      if (res.count != null) state.count = res.count;
+      const rawPosts = res.posts || [];
+      if (rawPosts.length === 0) {
+        // End of results — bump page so the next click doesn't re-query the same one.
+        state.page = nextPage;
+        break;
+      }
+      // Apply the Settings → "Тип медиа" filter to the preview itself: drop
+      // posts whose pictures don't include any of the selected kinds. Without
+      // this, only the download phase honoured the toggle and previews
+      // showed everything regardless.
+      const posts = filterByKinds(rawPosts);
+      // Server-side sort isn't reliable across paginated calls (e.g. sortByRating
+      // shuffles between pages). Dedup by postId — JR sometimes overlaps pages —
+      // then re-sort client-side by the user's chosen mode.
+      state.results = sortResults(dedupPosts(state.results.concat(posts)));
+      state.page = nextPage;
+      fetched++;
+      // Mid-loop render so the user sees the grid filling in instead of a long blank.
+      render({ skipCapture: true });
+      // If we've hit JR's total count, stop early — more API calls would just return [].
+      if (state.count != null && state.results.length >= state.count) break;
+    }
+  } catch (e) {
+    showToast('error', String(e));
+  } finally {
+    state.searching = false;
+    render();
+  }
+}
+
+async function doAddJob() {
+  captureInputs();
+  const outDir = $('#f-outdir').value.trim();
+  if (!outDir) {
+    showToast('error', 'Укажи папку для скачивания.');
+    render();
+    return;
+  }
+  // If the user is in manual-select mode and has picked specific tiles, build
+  // a SelectedItems payload from the previews currently in state. The backend
+  // bypasses Search and downloads exactly these pictures. When manual mode is
+  // off, ignore any leftover selection — it's invisible to the user.
+  //
+  // Skip fully-downloaded posts as a final guard — the UI already disables
+  // the checkbox on them, but this catches the case where a parallel job
+  // finished between selection and Add click.
+  const selectedItems = state.manualSelect && state.selectedPosts.size > 0
+    ? state.results
+        .filter(p => state.selectedPosts.has(p.postId) && tileDownloadState(p) !== 'full')
+        .map(p => collectSelectedItem(p))
+    : null;
+  if (selectedItems && selectedItems.length === 0) {
+    showToast('error', 'Выбранные посты уже скачаны в эту папку.');
+    render({ skipCapture: true });
+    return;
+  }
+  const input = {
+    ...collectInput(1),
+    mediaKinds: [...state.kinds],
+    minWidth:  parseStoredInt('f-min-width', 0),
+    minHeight: parseStoredInt('f-min-height', 0),
+    dateFrom:  state.formInputs['f-from'] || '',
+    dateTo:    state.formInputs['f-to'] || '',
+    limit:     parseStoredInt('f-limit', 0),
+    workers:   parseStoredInt('f-workers', 4) || 4,
+    filenameFormat: state.filenameFormat || 'id',
+    outDir,
+    ...(selectedItems ? { selectedItems } : {}),
+  };
+  hideToast();
+  // Empty name → backend uses defaultJobName(in) which builds a label from
+  // the filters (#tag, @user, ≥rating, …) or "Выбранные ×N" in manual mode.
+  const res = await AddJob('', input);
+  if (res.error) {
+    showToast('error', res.error);
+  } else {
+    const n = selectedItems ? selectedItems.length : null;
+    showToast('success', (n ? `${n} пост(а/ов) добавлено в очередь` : 'Задача добавлена в очередь') + ' — открой «📋 Очередь» наверху, чтобы посмотреть прогресс');
+    localStorage.setItem(LS_OUTDIR, outDir);
+    if (selectedItems) state.selectedPosts.clear();
+  }
+  render({ skipCapture: true });
+}
+
+// collectSelectedItem packs a Preview into the SelectedItem shape the Go
+// backend expects (postId, tags, and the picture URLs we already received
+// from Search — no second round-trip needed).
+function collectSelectedItem(p) {
+  return {
+    postId: p.postId,
+    tags: p.tags || [],
+    pictures: (p.pictures || []).map(pic => ({
+      attrId: pic.attrId,
+      url:    pic.url,
+      type:   pic.type,
+    })),
+  };
+}
+
+// doSaveCurrentPost enqueues just the post currently shown in the right-
+// click overlay. Same backend path as the bulk-selection AddJob, but with
+// a single item — keeps the "this one specifically" UX flow distinct from
+// "everything matching the filters".
+async function doSaveCurrentPost() {
+  const post = state.postModal?.post;
+  if (!post) return;
+  captureInputs();
+  const outDir = (state.formInputs['f-outdir'] || '').trim();
+  if (!outDir) {
+    showToast('error', 'Сначала укажи папку для скачивания в шапке.');
+    render({ skipCapture: true });
+    return;
+  }
+  const input = {
+    ...collectInput(1),
+    mediaKinds: [...state.kinds],
+    minWidth:  parseStoredInt('f-min-width', 0),
+    minHeight: parseStoredInt('f-min-height', 0),
+    dateFrom:  state.formInputs['f-from'] || '',
+    dateTo:    state.formInputs['f-to'] || '',
+    limit:     parseStoredInt('f-limit', 0),
+    workers:   parseStoredInt('f-workers', 4) || 4,
+    filenameFormat: state.filenameFormat || 'id',
+    outDir,
+    selectedItems: [collectSelectedItem(post)],
+  };
+  const res = await AddJob('', input);
+  if (res.error) {
+    showToast('error', res.error);
+  } else {
+    showToast('success', `Пост #${post.postNum} добавлен в очередь`);
+  }
+  render({ skipCapture: true });
+}
+
+async function doClearFinished() {
+  await ClearFinishedJobs();
+}
+
+async function doRemoveJob(id) {
+  const err = await RemoveJob(id);
+  if (err) {
+    showToast('error', err);
+    render();
+  }
+}
+
+async function doOpenJobFolder(id) {
+  const j = state.jobs.find(x => x.id === id);
+  if (!j) return;
+  const err = await OpenOutputFolder(j.outDir);
+  if (err) {
+    showToast('error', `не открылась: ${err}`);
+    render();
+  }
+}
+
+async function doOpenCurrentOutdir() {
+  captureInputs();
+  const path = (state.formInputs['f-outdir'] || '').trim();
+  if (!path) {
+    showToast('error', 'Папка не задана.');
+    render({ skipCapture: true });
+    return;
+  }
+  const err = await OpenOutputFolder(path);
+  if (err) {
+    showToast('error', `не открылась: ${err}`);
+    render({ skipCapture: true });
+  }
+}
+
+async function doPickFolder() {
+  captureInputs();
+  const path = await PickFolder();
+  if (path) {
+    state.formInputs['f-outdir'] = path;
+    localStorage.setItem(LS_OUTDIR, path);
+    syncOutdirToPreset();
+    await refreshDownloadedKeys();
+    render({ skipCapture: true });
+  }
+}
+
+function openLogin() {
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `
+    <div class="modal">
+      <h3>Вход на Joyreactor</h3>
+      <div class="field">
+        <label>Имя пользователя</label>
+        <input type="text" id="m-name" autocomplete="username">
+      </div>
+      <div class="field">
+        <label>Пароль</label>
+        <input type="password" id="m-pass" autocomplete="current-password">
+      </div>
+      <div id="m-err" style="color: #fca5a5; font-size: 13px; min-height: 18px;"></div>
+      <div class="actions">
+        <button class="btn" id="m-cancel">Отмена</button>
+        <button class="btn primary" id="m-go">Войти</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  modal.querySelector('#m-name').focus();
+  modal.querySelector('#m-cancel').addEventListener('click', close);
+  modal.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+  const submit = async () => {
+    const name = modal.querySelector('#m-name').value.trim();
+    const pass = modal.querySelector('#m-pass').value;
+    if (!name || !pass) return;
+    modal.querySelector('#m-go').disabled = true;
+    try {
+      const res = await Login(name, pass);
+      if (res.success) {
+        state.user = res.username;
+        showToast('success', `Добро пожаловать, ${res.username}!`);
+        close();
+        render();
+      } else {
+        modal.querySelector('#m-err').textContent = res.error || 'не удалось войти';
+        modal.querySelector('#m-go').disabled = false;
+      }
+    } catch (e) {
+      modal.querySelector('#m-err').textContent = String(e);
+      modal.querySelector('#m-go').disabled = false;
+    }
+  };
+  modal.querySelector('#m-go').addEventListener('click', submit);
+  modal.querySelector('#m-pass').addEventListener('keydown', e => {
+    if (e.key === 'Enter') submit();
+  });
+}
+
+async function doLogout() {
+  await Logout();
+  state.user = '';
+  showToast('success', 'Вышли');
+  render();
+}
+
+// ----- Presets -----
+async function refreshPresets() {
+  try { state.presets = (await ListPresets()) || []; }
+  catch { state.presets = []; }
+}
+
+async function applyPreset(name) {
+  if (!name) {
+    state.currentPreset = '';
+    localStorage.removeItem(LS_LAST_PRESET);
+    render();
+    return;
+  }
+  const p = await GetPreset(name);
+  if (!p) {
+    showToast('error', `Пресет «${name}» не найден`);
+    render();
+    return;
+  }
+  state.currentPreset = name;
+  localStorage.setItem(LS_LAST_PRESET, name);
+  // Switching presets implies the user is moving to a different topic — drop
+  // any pending tile selection so it doesn't leak across contexts.
+  state.selectedPosts.clear();
+  state.tags = p.tags || [];
+  state.excludeTags = p.excludeTags || [];
+  state.sort = p.sort || 'rating';
+  state.kinds = sanitizeKinds(p.mediaKinds);
+  // Output dir is part of the preset — when loading, swap to the preset's
+  // dir. Empty preset.outDir falls back to the last-typed value so users
+  // upgrading from the old single-dir setup don't lose their folder.
+  const outDir = p.outDir || state.formInputs['f-outdir'] || '';
+  state.formInputs = {
+    ...state.formInputs,
+    'f-query': p.query || '',
+    'f-user': p.username || '',
+    'f-min-rating': p.minRating != null ? String(p.minRating) : '',
+    'f-max-rating': p.maxRating != null ? String(p.maxRating) : '',
+    'f-nsfw': !!p.showNsfw,
+    'f-only-nsfw': !!p.onlyNsfw,
+    'f-unsafe': !!p.showUnsafe,
+    'f-favorite': !!p.onlyFavorite,
+    'f-min-width': p.minWidth ? String(p.minWidth) : '',
+    'f-min-height': p.minHeight ? String(p.minHeight) : '',
+    'f-from': p.dateFrom || '',
+    'f-to': p.dateTo || '',
+    'f-limit': p.limit ? String(p.limit) : '',
+    'f-workers': p.workers ? String(p.workers) : '4',
+    'f-outdir': outDir,
+  };
+  if (outDir) localStorage.setItem(LS_OUTDIR, outDir);
+  await refreshDownloadedKeys();
+  showToast('success', `Загружен пресет «${name}»`);
+  render({ skipCapture: true });
+}
+
+function sanitizeKinds(arr) {
+  const ok = new Set(['image','gif','video']);
+  return Array.isArray(arr) ? arr.filter(k => ok.has(k)) : [];
+}
+
+function collectPreset() {
+  captureInputs();
+  const num = id => {
+    const v = state.formInputs[id];
+    if (v === '' || v == null) return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    query: state.formInputs['f-query'] || '',
+    tags: [...state.tags],
+    excludeTags: [...state.excludeTags],
+    username: state.formInputs['f-user'] || '',
+    minRating: num('f-min-rating'),
+    maxRating: num('f-max-rating'),
+    sort: state.sort,
+    showNsfw: !!state.formInputs['f-nsfw'],
+    onlyNsfw: !!state.formInputs['f-only-nsfw'],
+    showUnsafe: !!state.formInputs['f-unsafe'],
+    onlyFavorite: !!state.formInputs['f-favorite'],
+    mediaKinds: [...state.kinds],
+    minWidth: num('f-min-width') || 0,
+    minHeight: num('f-min-height') || 0,
+    dateFrom: state.formInputs['f-from'] || '',
+    dateTo: state.formInputs['f-to'] || '',
+    limit: num('f-limit') || 0,
+    workers: num('f-workers') || 4,
+    outDir: state.formInputs['f-outdir'] || '',
+  };
+}
+
+// refreshDownloadedKeys reloads the manifest for the current outdir so
+// already-downloaded posts get the green check on preview tiles. Cheap to
+// call — manifest reads are local file I/O, no network. Side-effect: any
+// post that just became fully-downloaded is removed from state.selectedPosts
+// so it doesn't quietly stay "selected" with no actionable work.
+async function refreshDownloadedKeys() {
+  const outDir = state.formInputs['f-outdir'] || '';
+  if (!outDir) {
+    state.downloaded = { outDir: '', keys: new Set() };
+    return;
+  }
+  try {
+    const keys = (await ManifestKeys(outDir)) || [];
+    state.downloaded = { outDir, keys: new Set(keys) };
+  } catch {
+    state.downloaded = { outDir, keys: new Set() };
+  }
+  cleanupFullyDownloadedSelection();
+}
+
+function cleanupFullyDownloadedSelection() {
+  if (state.selectedPosts.size === 0) return;
+  for (const id of Array.from(state.selectedPosts)) {
+    const p = state.results.find(r => r.postId === id);
+    if (p && tileDownloadState(p) === 'full') state.selectedPosts.delete(id);
+  }
+}
+
+// maybeRefreshDownloadedKeys throttles refreshes to ~1Hz so live job:update
+// events don't pummel the disk with manifest reads on every progress tick.
+// Schedules a re-render after the refresh completes so newly-downloaded
+// posts get their check marks without waiting for the next event.
+let _lastManifestRefresh = 0;
+function maybeRefreshDownloadedKeys() {
+  const now = Date.now();
+  if (now - _lastManifestRefresh < 1000) return;
+  _lastManifestRefresh = now;
+  refreshDownloadedKeys().then(() => render({ skipCapture: true }));
+}
+
+// syncOutdirToPreset persists the current outdir field back into the selected
+// preset. Called whenever the user edits/picks a folder while a preset is
+// active so the binding stays "hard" — no implicit divergence between the
+// preset and what's in the input.
+//
+// We reload the stored preset and only mutate outDir to avoid silently
+// saving the user's other in-flight edits (those still go through the
+// explicit "Save as…" flow).
+async function syncOutdirToPreset() {
+  if (!state.currentPreset) return;
+  const existing = await GetPreset(state.currentPreset);
+  if (!existing) return;
+  existing.outDir = state.formInputs['f-outdir'] || '';
+  await SavePreset(state.currentPreset, existing);
+}
+
+async function doSavePreset() {
+  showPrompt('Сохранить пресет', 'Имя пресета', state.currentPreset || '', async name => {
+    name = name.trim();
+    if (!name) return false;
+    const err = await SavePreset(name, collectPreset());
+    if (err) return { error: err };
+    state.currentPreset = name;
+    localStorage.setItem(LS_LAST_PRESET, name);
+    await refreshPresets();
+    showToast('success', `Пресет «${name}» сохранён`);
+    render();
+    return true;
+  });
+}
+
+async function doDeletePreset() {
+  const name = state.currentPreset;
+  if (!name) return;
+  showConfirm(`Удалить пресет «${name}»?`, async () => {
+    const err = await DeletePreset(name);
+    if (err) showToast('error', err);
+    else {
+      state.currentPreset = '';
+      localStorage.removeItem(LS_LAST_PRESET);
+      await refreshPresets();
+      showToast('success', `Пресет «${name}» удалён`);
+    }
+    render();
+  });
+}
+
+// ----- Modal helpers -----
+function showPrompt(title, label, defaultValue, onSubmit) {
+  const m = document.createElement('div');
+  m.className = 'modal-backdrop';
+  m.innerHTML = `
+    <div class="modal">
+      <h3>${escape(title)}</h3>
+      <div class="field">
+        <label>${escape(label)}</label>
+        <input type="text" id="p-input" value="${escape(defaultValue)}">
+      </div>
+      <div id="p-err" style="color: #fca5a5; font-size: 13px; min-height: 18px;"></div>
+      <div class="actions">
+        <button class="btn" id="p-cancel">Отмена</button>
+        <button class="btn primary" id="p-ok">Ок</button>
+      </div>
+    </div>`;
+  document.body.appendChild(m);
+  const input = m.querySelector('#p-input');
+  input.focus(); input.select();
+  const close = () => m.remove();
+  m.querySelector('#p-cancel').addEventListener('click', close);
+  const submit = async () => {
+    m.querySelector('#p-ok').disabled = true;
+    try {
+      const r = await onSubmit(input.value);
+      if (r === true) { close(); return; }
+      if (r && r.error) m.querySelector('#p-err').textContent = r.error;
+      m.querySelector('#p-ok').disabled = false;
+    } catch (e) {
+      m.querySelector('#p-err').textContent = String(e);
+      m.querySelector('#p-ok').disabled = false;
+    }
+  };
+  m.querySelector('#p-ok').addEventListener('click', submit);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') submit();
+    if (e.key === 'Escape') close();
+  });
+}
+
+function showConfirm(text, onYes) {
+  const m = document.createElement('div');
+  m.className = 'modal-backdrop';
+  m.innerHTML = `
+    <div class="modal">
+      <h3>${escape(text)}</h3>
+      <div class="actions">
+        <button class="btn" id="c-no">Отмена</button>
+        <button class="btn danger" id="c-yes">Удалить</button>
+      </div>
+    </div>`;
+  document.body.appendChild(m);
+  m.querySelector('#c-yes').focus();
+  const close = () => m.remove();
+  m.querySelector('#c-no').addEventListener('click', close);
+  m.querySelector('#c-yes').addEventListener('click', async () => { close(); await onYes(); });
+  m.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+}
+
+// ----- Generic autocomplete -----
+function attachAutocomplete(input, lookup, onPick, opts = {}) {
+  if (!input) return;
+  const clearOnPick = opts.clearOnPick !== false;
+  const minMaskLen = opts.minMaskLen ?? 1;
+
+  let timer = 0;
+  let items = [];
+  let active = -1;
+  let dropdown = null;
+  let lastMask = '';
+  let reqSeq = 0;
+
+  const close = () => {
+    if (dropdown) { dropdown.remove(); dropdown = null; }
+    items = []; active = -1;
+  };
+  const updateActive = () => {
+    if (!dropdown) return;
+    [...dropdown.querySelectorAll('.ac-item')].forEach((el, i) => {
+      el.classList.toggle('active', i === active);
+      if (i === active) el.scrollIntoView({ block: 'nearest' });
+    });
+  };
+  const open = (suggestions) => {
+    close();
+    if (!suggestions || suggestions.length === 0) return;
+    items = suggestions; active = 0;
+    dropdown = document.createElement('div');
+    dropdown.className = 'autocomplete';
+    dropdown.innerHTML = items.map((s, i) => `
+      <div class="ac-item ${i === 0 ? 'active' : ''}" data-i="${i}">
+        <span class="ac-name">${escape(s.name)}</span>
+        <span class="ac-meta">
+          ${s.nsfw ? '<span class="ac-nsfw">NSFW</span>' : ''}
+          ${s.count != null ? `<span class="ac-count">${formatCount(s.count)}</span>` : ''}
+        </span>
+      </div>`).join('');
+    input.parentElement.appendChild(dropdown);
+    [...dropdown.querySelectorAll('.ac-item')].forEach(el => {
+      el.addEventListener('mousedown', e => { e.preventDefault(); pick(items[parseInt(el.dataset.i, 10)]); });
+    });
+  };
+  const pick = (item) => {
+    if (!item) return;
+    onPick(item.name);
+    if (clearOnPick) input.value = '';
+    lastMask = ''; close(); input.focus();
+  };
+  input.addEventListener('input', e => {
+    clearTimeout(timer);
+    const mask = e.target.value.trim();
+    if (!mask || mask.length < minMaskLen) { close(); lastMask = ''; return; }
+    if (mask === lastMask) return;
+    lastMask = mask;
+    const my = ++reqSeq;
+    timer = setTimeout(async () => {
+      try {
+        const res = await lookup(mask);
+        if (my !== reqSeq) return;
+        open(res || []);
+      } catch {}
+    }, 200);
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); if (items.length) { active = (active + 1) % items.length; updateActive(); } }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); if (items.length) { active = (active - 1 + items.length) % items.length; updateActive(); } }
+    else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (active >= 0 && items[active]) pick(items[active]);
+      else { const v = input.value.trim(); if (v) { onPick(v); input.value = ''; lastMask = ''; close(); } }
+    } else if (e.key === 'Escape') close();
+  });
+  input.addEventListener('blur', () => setTimeout(close, 120));
+}
+
+function formatCount(n) {
+  if (!n) return '0';
+  if (n >= 1000) return Math.round(n / 100) / 10 + 'k';
+  return String(n);
+}
+
+function attachUserValidation(input, hint) {
+  if (!input || !hint) return;
+  let timer = 0, seq = 0;
+  const update = (cls, text) => { hint.className = 'field-hint ' + (cls || ''); hint.textContent = text || ''; };
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const name = input.value.trim();
+    if (!name) { update('', ''); return; }
+    update('pending', '…');
+    const my = ++seq;
+    timer = setTimeout(async () => {
+      try {
+        const r = await CheckUser(name);
+        if (my !== seq) return;
+        if (r && r.found) update('ok', `✓ ${r.username} · ${r.postNum} постов`);
+        else update('err', 'не найден');
+      } catch { if (my === seq) update('err', 'ошибка проверки'); }
+    }, 350);
+  });
+}
+
+// ----- Events -----
+EventsOn('job:update', j => {
+  const i = state.jobs.findIndex(x => x.id === j.id);
+  if (i >= 0) state.jobs[i] = j;
+  else state.jobs.push(j);
+  // If this job is writing into the folder we're currently previewing,
+  // refresh the manifest so new tiles light up green as files land.
+  const cur = state.formInputs['f-outdir'] || '';
+  if (cur && j.outDir === cur) {
+    if (isFinished(j.state)) {
+      _lastManifestRefresh = 0;            // force, ignore throttle
+      refreshDownloadedKeys().then(() => render({ skipCapture: true }));
+    } else {
+      maybeRefreshDownloadedKeys();
+    }
+  }
+  render();
+});
+
+EventsOn('job:removed', id => {
+  state.jobs = state.jobs.filter(j => j.id !== id);
+  render();
+});
+
+EventsOn('auth:blocked-tags', n => {
+  state.blockedCount = n || 0;
+  render();
+});
+
+// ----- Boot -----
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (state.postModal)    { closePostPreview(); return; }
+  if (state.queueOpen)    { closeQueue();        return; }
+  if (state.settingsOpen) { closeSettings();     return; }
+});
+
+// When the user comes back from File Explorer (e.g. after deleting files
+// or the manifest manually), re-read the manifest so green checkmarks
+// reflect the actual on-disk state. visibilitychange is the belt-and-
+// suspenders for Win11 virtual-desktop switches where 'focus' is patchy.
+async function refreshOnReturn() {
+  if (!(state.formInputs['f-outdir'] || '').trim()) return;
+  await refreshDownloadedKeys();
+  render({ skipCapture: true });
+}
+window.addEventListener('focus', refreshOnReturn);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshOnReturn();
+});
+
+(async () => {
+  try { state.user = await Me(); } catch {}
+  try {
+    const ws = await GetWindowSettings();
+    if (ws) state.windowSettings = {
+      width:     ws.width  || state.windowSettings.width,
+      height:    ws.height || state.windowSettings.height,
+      maximized: !!ws.maximized,
+    };
+  } catch {}
+  try {
+    const app = await GetAppSettings();
+    if (app && app.manifestMode) state.appSettings.manifestMode = app.manifestMode;
+  } catch {}
+  await refreshPresets();
+  try { state.blockedCount = (await BlockedTagCount()) || 0; } catch {}
+  try { state.jobs = (await ListJobs()) || []; } catch {}
+  // Auto-restore the last preset the user touched — applyPreset itself
+  // re-saves it to localStorage, so this is idempotent. Falls back silently
+  // if the preset was deleted while the app was closed.
+  const lastPreset = lsStr(LS_LAST_PRESET, '');
+  if (lastPreset && state.presets.includes(lastPreset)) {
+    await applyPreset(lastPreset);          // also calls refreshDownloadedKeys
+  } else {
+    await refreshDownloadedKeys();           // ad-hoc mode: still mark via LS_OUTDIR
+    render();
+  }
+})();

@@ -1,0 +1,134 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+    # Tags like v1.0.0 trigger the same build + a release job that attaches
+    # the three platform artifacts to a new GitHub Release (draft).
+    tags: ['v*']
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+# Cancel any in-flight build for the same ref when a new commit comes in,
+# so we don't burn three runners per push when force-pushing edits.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 has libwebkit2gtk-4.0-dev which Wails v2 links against.
+          # ubuntu-24.04 only ships 4.1 and would need -tags webkit2_41 — pinned
+          # to 22.04 instead to keep the build flags identical across OSes.
+          - os: ubuntu-22.04
+            label: linux
+            artifact: joyreactorDownloader-linux
+            artifact-path: cmd/joyreactor-gui/build/bin/joyreactorDownloader
+          - os: windows-latest
+            label: windows
+            artifact: joyreactorDownloader-windows
+            artifact-path: cmd/joyreactor-gui/build/bin/joyreactorDownloader.exe
+          - os: macos-latest
+            label: macos
+            artifact: joyreactorDownloader-macos
+            artifact-path: cmd/joyreactor-gui/build/bin/joyreactorDownloader.app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          # Caches both ~/go/pkg/mod and the build cache; saves ~60s on warm runs.
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: cmd/joyreactor-gui/frontend/package-lock.json
+
+      - name: Install Linux WebView / GTK dev libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            pkg-config
+
+      # Pin the Wails CLI version to match what go.mod uses, so the bindings
+      # generator output stays identical across runs and platforms.
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      # wails.json + main.go live in cmd/joyreactor-gui/ per the project
+      # layout. Wails CLI uses the cwd to find its anchor.
+      - name: Build
+        working-directory: cmd/joyreactor-gui
+        run: wails build -clean
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact-path }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # Runs only on tag pushes (v1.0.0, v2.3.4-beta, …). Downloads the three
+  # platform artifacts produced above, zips each with the tag name baked
+  # into the filename, and attaches them to a draft GitHub Release. We
+  # leave the release in draft so you can edit the notes / hit publish
+  # manually rather than auto-shipping every tag.
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write    # required to create releases & upload assets
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package per-platform zips with version in the name
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for label in windows linux macos; do
+            src="artifacts/joyreactorDownloader-${label}"
+            if [[ -d "$src" ]]; then
+              # Re-zip so the asset filename carries the version (the raw
+              # build artifact is just the .exe / binary / .app bundle).
+              (cd "$src" && zip -qr "../../dist/joyreactorDownloader-${VERSION}-${label}.zip" .)
+            fi
+          done
+          ls -la dist/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          # Auto-fills body from commits since the previous release.
+          generate_release_notes: true
+          # Draft so you can review/edit before going public. Flip to false
+          # if you want every tag-push to auto-publish.
+          draft: true
+          # Marks pre-releases automatically (v1.0.0-rc.1, v2.0.0-beta etc.).
+          prerelease: ${{ contains(github.ref_name, '-') }}

@@ -1,0 +1,28 @@
+/bin/
+/dist/
+/downloads/
+*.exe
+*.test
+*.out
+.idea/
+.vscode/
+.env
+.env.local
+
+# Wails build artifacts (sit next to wails.json — at cmd/joyreactor-gui/
+# after the golang-standards/project-layout move).
+cmd/joyreactor-gui/build/bin/
+cmd/joyreactor-gui/frontend/node_modules/
+cmd/joyreactor-gui/frontend/dist/
+cmd/joyreactor-gui/frontend/wailsjs/
+
+# Claude Code per-user local config (allowlist, permissions, defaultMode).
+# CLAUDE.md and (optionally) .claude/settings.json are the team-shared bits;
+# settings.local.json is personal and should not be pushed.
+.claude/settings.local.json
+
+# Throwaway screenshots from scripts/screenshot.ps1 + ad-hoc crops created
+# during UI smoke tests. The folder itself stays tracked via .gitkeep so
+# the screenshot scripts have a stable target path on a fresh clone.
+/screenshots/*
+!/screenshots/.gitkeep
