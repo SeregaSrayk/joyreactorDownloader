@@ -121,29 +121,34 @@ jobs:
           done
           ls -la dist/
 
-      # Per-version release notes can live in docs/releases/<tag>.md.
-      # If that file exists for the tag being built, use it as the release
-      # body (auto-gen still appends commit summary at the bottom). If
-      # not, fall through to pure auto-gen.
-      - name: Resolve release-notes file for this tag
+      # Per-version release notes live in docs/releases/<tag>.md. We read
+      # the file contents into a step output and pass it as `body` rather
+      # than `body_path` — softprops's body_path resolution was unreliable
+      # when combined with generate_release_notes (silently produced an
+      # empty release body). Direct `body` works.
+      - name: Read release-notes file for this tag
         id: notes
         shell: bash
         run: |
           f="docs/releases/${GITHUB_REF_NAME}.md"
           if [ -f "$f" ]; then
-            echo "Using $f as release body"
-            echo "path=$f" >> "$GITHUB_OUTPUT"
+            echo "Using $f as release body ($(wc -c <"$f") bytes)"
+            {
+              echo 'body<<__JRD_BODY_EOF__'
+              cat "$f"
+              echo '__JRD_BODY_EOF__'
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "No $f — falling back to auto-generated release notes"
+            echo "No $f — falling back to pure auto-generated release notes"
           fi
 
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
-          body_path: ${{ steps.notes.outputs.path }}
-          # Generates the commit summary below body_path's content (or
-          # alone, when no notes file is present).
+          body: ${{ steps.notes.outputs.body }}
+          # When body is set, this appends the auto-generated commit summary
+          # below it. When body is empty, generates the body from scratch.
           generate_release_notes: true
           # Draft so you can review/edit before going public. Flip to false
           # if you want every tag-push to auto-publish.
