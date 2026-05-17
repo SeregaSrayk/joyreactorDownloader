@@ -333,6 +333,13 @@ type DownloadInput struct {
 	OutDir         string   `json:"outDir"`
 	FilenameFormat string   `json:"filenameFormat"` // "id" (default) | "tags"
 
+	// PageFrom / PageTo bound the Query.search.postPager iteration in
+	// produce(). PageFrom <= 1 (or 0) means "start at page 1"; PageTo <= 0
+	// means "no upper bound". Used to skip an already-fetched prefix or
+	// constrain the run to a known-good range.
+	PageFrom int `json:"pageFrom"`
+	PageTo   int `json:"pageTo"`
+
 	// SelectedItems, when non-empty, switches the job to a fan-out over those
 	// specific posts instead of paginating Query.search. Search/criteria
 	// filters (tags / nsfw / rating / size / etc.) are bypassed — the user
@@ -605,7 +612,17 @@ func truncate(s string, n int) string {
 func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *downloader.Downloader, jobs chan<- downloader.Job, pause *pauseGate, nameFormat string) error {
 	seen := make(map[string]struct{})
 	sent := 0
-	for page := 1; ; page++ {
+	// Page range honours Criteria.PageFrom / PageTo. PageFrom <=1 (or 0)
+	// behaves like the historical "start at 1"; PageTo <=0 means "no upper
+	// bound, paginate until the API runs out of posts".
+	startPage := c.PageFrom
+	if startPage < 1 {
+		startPage = 1
+	}
+	for page := startPage; ; page++ {
+		if c.PageTo > 0 && page > c.PageTo {
+			return nil
+		}
 		if err := pause.Wait(ctx); err != nil {
 			return err
 		}
@@ -737,6 +754,8 @@ func criteriaFromDownload(in DownloadInput) filter.Criteria {
 	c.DateFrom, _ = parseDate(in.DateFrom)
 	c.DateTo, _ = parseDate(in.DateTo)
 	c.Limit = in.Limit
+	c.PageFrom = in.PageFrom
+	c.PageTo = in.PageTo
 	return c
 }
 

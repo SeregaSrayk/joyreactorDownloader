@@ -47,7 +47,9 @@ type Criteria struct {
 	DateTo     time.Time // zero = unbounded
 
 	// --- run controls ---
-	Limit int // max files to download (0 = unlimited)
+	Limit    int // max files to download (0 = unlimited)
+	PageFrom int // start search at this 1-based page (0 or 1 = start from beginning)
+	PageTo   int // stop after this 1-based page, inclusive (0 = no upper bound)
 }
 
 // MatchImage applies client-side filters that depend only on a single image.

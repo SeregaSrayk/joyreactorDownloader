@@ -479,6 +479,22 @@ function renderSettingsModal() {
               <input type="number" id="f-workers" value="4" min="1" max="16">
             </div>
           </div>
+          <div class="row">
+            <div class="field">
+              <label>Со страницы</label>
+              <input type="number" id="f-page-from" placeholder="1" min="1">
+            </div>
+            <div class="field">
+              <label>До страницы (включительно)</label>
+              <input type="number" id="f-page-to" placeholder="0 = до конца" min="0">
+            </div>
+          </div>
+          <div class="field-hint">
+            JR отдаёт ~10 постов на странице. По умолчанию пагинация идёт
+            от 1 до последней. «Со страницы 51» — пропустить первые 50
+            (≈500 постов уже скачано). «До страницы 100» — остановиться
+            после неё. Полезно для resume или для нарезки на сегменты.
+          </div>
         </div>
 
         <div class="settings-section">
@@ -1001,7 +1017,7 @@ function chip(text, kind, i) {
 
 // ----- Input preservation across re-renders -----
 // All known input ids — only those present in the current DOM are captured/restored.
-const inputIds = ['f-query','f-user','f-min-rating','f-max-rating','f-nsfw','f-only-nsfw','f-unsafe','f-favorite','f-use-blocked','f-min-width','f-min-height','f-from','f-to','f-limit','f-workers','f-outdir'];
+const inputIds = ['f-query','f-user','f-min-rating','f-max-rating','f-nsfw','f-only-nsfw','f-unsafe','f-favorite','f-use-blocked','f-min-width','f-min-height','f-from','f-to','f-limit','f-workers','f-page-from','f-page-to','f-outdir'];
 
 function captureInputs() {
   for (const id of inputIds) {
@@ -1590,10 +1606,15 @@ async function doSearch(reset) {
   captureInputs();
   state.searching = true;
   hideToast();
+  // Honour the user's PageFrom/PageTo for the preview too — start at
+  // PageFrom on a fresh search so what's shown lines up with what would
+  // actually be downloaded.
+  const pageFrom = parseStoredInt('f-page-from', 0);
+  const pageTo   = parseStoredInt('f-page-to',   0);
   if (reset) {
     state.results = [];
     state.count = null;
-    state.page = 0;
+    state.page = Math.max(0, pageFrom - 1);   // next page = pageFrom
     // The previously-selected post ids would no longer match any visible
     // tile, so clear them to avoid invisible selection state.
     state.selectedPosts.clear();
@@ -1608,6 +1629,11 @@ async function doSearch(reset) {
   try {
     while (state.results.length - startLen < target && fetched < maxPages) {
       const nextPage = state.page + 1;
+      if (pageTo > 0 && nextPage > pageTo) {
+        // User-defined upper bound reached.
+        state.page = nextPage - 1;
+        break;
+      }
       const res = await Search(collectInput(nextPage));
       if (res.error) {
         showToast('error', res.error);
@@ -1679,6 +1705,8 @@ async function doAddJob() {
     dateTo:    state.formInputs['f-to'] || '',
     limit:     parseStoredInt('f-limit', 0),
     workers:   parseStoredInt('f-workers', 4) || 4,
+    pageFrom:  parseStoredInt('f-page-from', 0),
+    pageTo:    parseStoredInt('f-page-to', 0),
     filenameFormat: state.filenameFormat || 'id',
     outDir,
     ...(selectedItems ? { selectedItems } : {}),
@@ -1905,6 +1933,8 @@ async function applyPreset(name) {
     'f-to': p.dateTo || '',
     'f-limit': p.limit ? String(p.limit) : '',
     'f-workers': p.workers ? String(p.workers) : '4',
+    'f-page-from': p.pageFrom ? String(p.pageFrom) : '',
+    'f-page-to':   p.pageTo   ? String(p.pageTo)   : '',
     'f-outdir': outDir,
   };
   if (outDir) localStorage.setItem(LS_OUTDIR, outDir);
@@ -1945,6 +1975,8 @@ function collectPreset() {
     dateTo: state.formInputs['f-to'] || '',
     limit: num('f-limit') || 0,
     workers: num('f-workers') || 4,
+    pageFrom: num('f-page-from') || 0,
+    pageTo: num('f-page-to') || 0,
     outDir: state.formInputs['f-outdir'] || '',
   };
 }

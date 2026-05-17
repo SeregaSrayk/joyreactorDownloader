@@ -33,6 +33,8 @@ type Preset struct {
 	DateTo          string `json:"dateTo"`
 	Limit           int    `json:"limit"`
 	Workers         int    `json:"workers"`
+	PageFrom        int    `json:"pageFrom,omitempty"`
+	PageTo          int    `json:"pageTo,omitempty"`
 	OutDir          string `json:"outDir,omitempty"`
 }
 
