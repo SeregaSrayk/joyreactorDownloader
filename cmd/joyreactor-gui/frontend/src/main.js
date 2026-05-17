@@ -4,7 +4,7 @@ import {
   AddJob, ListJobs, PauseJob, ResumeJob, CancelJob, RemoveJob, ClearFinishedJobs,
   PreviewJobName,
   PickFolder, OpenOutputFolder,
-  ListPresets, GetPreset, SavePreset, DeletePreset,
+  ListPresets, GetPreset, SavePreset, DeletePreset, SetPresetAutoPull,
   GetWindowSettings, SaveWindowSettings,
   GetAppSettings, SaveAppSettings,
   ManifestKeys, OpenManifestFolder, DeleteManifest,
@@ -57,10 +57,11 @@ const state = {
   },
   presets: [],
   currentPreset: '',
+  currentPresetAutoPull: false,
   blockedCount: 0,
   postModal: null,   // { post, comments, loading, error } when the right-click preview is open
   windowSettings: { width: 1180, height: 820, maximized: false },
-  appSettings: { manifestMode: 'per-folder' },
+  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false },
   downloaded: { outDir: '', keys: new Set() },  // attr IDs in the current outdir's .manifest.json
   selectedPosts: new Set(),  // postId strings the user manually picked for selective download
   manualSelect: lsBool(LS_MANUAL_SELECT, false),  // master toggle for the per-tile checkbox UI
@@ -262,6 +263,12 @@ function renderPresetSection() {
   const opts = ['<option value="">— пресет —</option>']
     .concat(state.presets.map(n => `<option value="${escape(n)}" ${n === state.currentPreset ? 'selected' : ''}>${escape(n)}</option>`))
     .join('');
+  const autoPullDisabled = state.currentPreset ? '' : 'disabled';
+  const autoPullChecked = state.currentPresetAutoPull ? 'checked' : '';
+  const interval = state.appSettings.autoPullIntervalHours || 24;
+  const autoPullTitle = state.currentPreset
+    ? `Раз в ${interval} ч сам докачивать новые картинки этого пресета в его папку (интервал меняется в Настройках)`
+    : 'Сначала выбери пресет — авто-обновление работает только для сохранённых';
   return `
     <div class="field">
       <label>Пресет</label>
@@ -270,6 +277,10 @@ function renderPresetSection() {
         <button class="btn small" id="btn-preset-save" title="Сохранить текущие фильтры как пресет">Сохранить как…</button>
         <button class="btn small" id="btn-preset-delete" ${state.currentPreset ? '' : 'disabled'}>Удалить</button>
       </div>
+      <label class="preset-autopull" title="${autoPullTitle}">
+        <input type="checkbox" id="preset-autopull" ${autoPullChecked} ${autoPullDisabled}>
+        🔄 Авто-обновлять этот пресет
+      </label>
     </div>`;
 }
 
@@ -432,6 +443,45 @@ function renderSettingsModal() {
             </label>
           </div>
           <div class="field-hint">При включении окно растянется на всё рабочее пространство, но не перекроет панель задач Windows. Ширина/высота сохранятся для случая, когда галку снимут.</div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Автозапуск и фон</h4>
+          <div class="toggles">
+            <label>
+              <input type="checkbox" id="s-autostart" ${state.appSettings.autostart ? 'checked' : ''}>
+              Запускать при старте системы
+            </label>
+            <label>
+              <input type="checkbox" id="s-start-min" ${state.appSettings.startMinimized ? 'checked' : ''}>
+              Открывать свёрнутым в трей
+            </label>
+            <label>
+              <input type="checkbox" id="s-min-on-close" ${state.appSettings.minimizeToTrayOnClose ? 'checked' : ''}>
+              При закрытии окна (✕) сворачивать в трей вместо выхода
+            </label>
+          </div>
+          <div class="field-hint">
+            Иконка в системном трее позволяет приложению работать в фоне:
+            планировщик авто-обновления пресетов тикает только пока процесс
+            запущен. Чтобы полностью выйти — правый клик по иконке в трее →
+            «Выход».
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Авто-обновление пресетов</h4>
+          <div class="field">
+            <label>Глобальный интервал между авто-обновлениями (часы)</label>
+            <input type="number" id="s-autopull-interval" min="1" max="720"
+                   value="${state.appSettings.autoPullIntervalHours || 24}">
+            <div class="field-hint">
+              Если в выпадайке пресетов отмечен чекбокс «🔄 Авто», такой
+              пресет раз в N часов сам докачивает новые картинки в свою
+              папку. Минимум 1 час. По умолчанию 24 (раз в сутки).
+              Глобальный интервал общий для всех «автоматических» пресетов.
+            </div>
+          </div>
         </div>
 
         <div class="settings-section">
@@ -1120,6 +1170,21 @@ function wireEvents() {
   $('#preset-sel')?.addEventListener('change', e => applyPreset(e.target.value));
   $('#btn-preset-save')?.addEventListener('click', doSavePreset);
   $('#btn-preset-delete')?.addEventListener('click', doDeletePreset);
+  $('#preset-autopull')?.addEventListener('change', async e => {
+    if (!state.currentPreset) return;
+    const on = e.target.checked;
+    const err = await SetPresetAutoPull(state.currentPreset, on);
+    if (err) {
+      showToast('error', `Не удалось переключить авто-обновление: ${err}`);
+      e.target.checked = !on;
+      return;
+    }
+    state.currentPresetAutoPull = on;
+    const intH = state.appSettings.autoPullIntervalHours || 24;
+    showToast('success', on
+      ? `Пресет «${state.currentPreset}» будет обновляться раз в ${intH} ч`
+      : `Авто-обновление пресета «${state.currentPreset}» выключено`);
+  });
 
   $('#s-show-author')?.addEventListener('change', e => {
     state.showAuthor = e.target.checked;
@@ -1192,21 +1257,48 @@ function wireEvents() {
     });
   });
 
+  // Helper — push the full state.appSettings to Go. Sending the full
+  // struct (not just one field) keeps the other AppSettings keys from
+  // being reset to their Go zero-values on a partial save.
+  const pushAppSettings = async () => {
+    const err = await SaveAppSettings({ ...state.appSettings });
+    if (err) showToast('error', `Не удалось сохранить настройки: ${err}`);
+    return err || '';
+  };
+
   $$('input[name="manifest-mode"]').forEach(r => {
     r.addEventListener('change', async e => {
       const mode = e.target.value;
       state.appSettings.manifestMode = mode;
-      const err = await SaveAppSettings({ manifestMode: mode });
-      if (err) {
-        showToast('error', `Не удалось сохранить: ${err}`);
-        return;
-      }
+      if (await pushAppSettings()) return;
       // The set of "already downloaded" tiles depends on which manifest
       // is consulted — refresh the badge cache after switching modes so
       // the grid updates immediately.
       await refreshDownloadedKeys();
       render({ skipCapture: true });
     });
+  });
+
+  $('#s-autostart')?.addEventListener('change', async e => {
+    state.appSettings.autostart = e.target.checked;
+    await pushAppSettings();
+  });
+  $('#s-start-min')?.addEventListener('change', async e => {
+    state.appSettings.startMinimized = e.target.checked;
+    await pushAppSettings();
+  });
+  $('#s-min-on-close')?.addEventListener('change', async e => {
+    state.appSettings.minimizeToTrayOnClose = e.target.checked;
+    await pushAppSettings();
+  });
+  $('#s-autopull-interval')?.addEventListener('change', async e => {
+    const n = parseInt(e.target.value, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      e.target.value = state.appSettings.autoPullIntervalHours || 24;
+      return;
+    }
+    state.appSettings.autoPullIntervalHours = n;
+    await pushAppSettings();
   });
 
   $('#btn-open-manifest')?.addEventListener('click', async () => {
@@ -1956,6 +2048,7 @@ async function refreshPresets() {
 async function applyPreset(name) {
   if (!name) {
     state.currentPreset = '';
+    state.currentPresetAutoPull = false;
     localStorage.removeItem(LS_LAST_PRESET);
     render();
     return;
@@ -1967,6 +2060,7 @@ async function applyPreset(name) {
     return;
   }
   state.currentPreset = name;
+  state.currentPresetAutoPull = !!p.autoPull;
   localStorage.setItem(LS_LAST_PRESET, name);
   // Switching presets implies the user is moving to a different topic — drop
   // any pending tile selection so it doesn't leak across contexts.
@@ -2356,7 +2450,13 @@ document.addEventListener('visibilitychange', () => {
   } catch {}
   try {
     const app = await GetAppSettings();
-    if (app && app.manifestMode) state.appSettings.manifestMode = app.manifestMode;
+    if (app) {
+      if (app.manifestMode) state.appSettings.manifestMode = app.manifestMode;
+      if (app.autoPullIntervalHours) state.appSettings.autoPullIntervalHours = app.autoPullIntervalHours;
+      state.appSettings.autostart = !!app.autostart;
+      state.appSettings.startMinimized = !!app.startMinimized;
+      state.appSettings.minimizeToTrayOnClose = !!app.minimizeToTrayOnClose;
+    }
   } catch {}
   await refreshPresets();
   try { state.blockedCount = (await BlockedTagCount()) || 0; } catch {}

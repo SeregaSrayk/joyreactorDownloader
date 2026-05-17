@@ -39,6 +39,7 @@ func main() {
 		EnableDefaultContextMenu: true,
 		OnStartup:                gui.startup,
 		OnShutdown:               gui.shutdown,
+		OnBeforeClose:            gui.onBeforeClose,
 		Bind: []any{
 			gui,
 		},

@@ -37,6 +37,8 @@ type GUI struct {
 	blockedTags []string
 
 	jobs *jobManager
+
+	tray *trayController
 }
 
 func NewGUI() *GUI { return &GUI{} }
@@ -57,16 +59,57 @@ func (g *GUI) startup(ctx context.Context) {
 	// invalidated cookie and appear logged out. Flush every 5 min while
 	// logged in; the on-shutdown hook covers normal app close.
 	go g.sessionPersistLoop()
+	// Background scheduler that watches presets opted into AutoPull and
+	// enqueues jobs whenever the global interval has elapsed.
+	go g.schedulerLoop()
+	// System tray icon — runs on its own platform message loop via
+	// systray.RunWithExternalLoop so it coexists with Wails. The window
+	// close hook checks tray.IsQuitting() to differentiate "user pressed
+	// Выход in tray menu" from "user pressed X on the window".
+	g.tray = newTrayController(g)
+	g.tray.Start()
+	// If the user enabled "start minimized" in settings, hide the window
+	// after Wails finishes its startup so the app boots into the tray.
+	if loadAppSettings().StartMinimized {
+		go func() {
+			// Defer past startup so the runtime context is alive and
+			// WindowHide actually has something to hide.
+			time.Sleep(200 * time.Millisecond)
+			wailsruntime.WindowHide(g.ctx)
+		}()
+	}
 }
 
 // shutdown is wired as the Wails OnShutdown callback; it flushes the most
 // recent session cookies to disk so the next launch sees what JR has
 // rotated to during this run, not whatever was current at login time.
+// Also tears down the tray icon so it disappears immediately on quit.
 func (g *GUI) shutdown(_ context.Context) {
-	if g.sessionPath == "" {
-		return
+	if g.sessionPath != "" {
+		_ = g.gql.SaveSession(g.sessionPath)
 	}
-	_ = g.gql.SaveSession(g.sessionPath)
+	if g.tray != nil {
+		g.tray.Stop()
+	}
+}
+
+// onBeforeClose is wired as the Wails OnBeforeClose callback. When the
+// user clicks the window's X (or Alt+F4 / Cmd+W) and MinimizeToTrayOnClose
+// is enabled in settings, we hide the window to the tray instead of
+// quitting the process. The tray menu's "Выход" remains the only way to
+// fully exit when this option is on.
+//
+// Returning true tells Wails "I handled the close, do NOT proceed with
+// shutdown"; false lets the normal exit path run.
+func (g *GUI) onBeforeClose(_ context.Context) bool {
+	if g.tray != nil && g.tray.IsQuitting() {
+		return false
+	}
+	if !loadAppSettings().MinimizeToTrayOnClose {
+		return false
+	}
+	wailsruntime.WindowHide(g.ctx)
+	return true
 }
 
 // sessionPersistLoop periodically writes the current cookie jar to disk
@@ -477,9 +520,17 @@ func (g *GUI) GetAppSettings() AppSettings { return loadAppSettings() }
 // SaveAppSettings writes preferences to settings.json. Returns "" on
 // success or the error message. Change takes effect for the next job;
 // already-running jobs keep their downloader instances unchanged.
+//
+// As a side effect, the Autostart flag is synced to the OS-level
+// autostart registration (Windows registry, macOS LaunchAgent,
+// Linux .desktop) — this keeps the user's "should I auto-launch?"
+// preference in a single canonical place.
 func (g *GUI) SaveAppSettings(s AppSettings) string {
 	if err := saveAppSettings(s); err != nil {
 		return err.Error()
+	}
+	if err := syncAutostart(s.Autostart); err != nil {
+		return "настройки сохранены, но автозапуск не удалось обновить: " + err.Error()
 	}
 	return ""
 }
@@ -616,6 +667,15 @@ func (g *GUI) SavePreset(name string, p Preset) string {
 
 func (g *GUI) DeletePreset(name string) string {
 	if err := g.presets.Delete(name); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// SetPresetAutoPull toggles a preset's opt-in flag for the background
+// scheduler. Returns "" on success or the error message.
+func (g *GUI) SetPresetAutoPull(name string, on bool) string {
+	if err := g.presets.SetAutoPull(name, on); err != nil {
 		return err.Error()
 	}
 	return ""
