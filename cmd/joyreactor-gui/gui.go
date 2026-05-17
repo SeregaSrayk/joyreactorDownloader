@@ -37,8 +37,6 @@ type GUI struct {
 	blockedTags []string
 
 	jobs *jobManager
-
-	tray *trayController
 }
 
 func NewGUI() *GUI { return &GUI{} }
@@ -62,14 +60,10 @@ func (g *GUI) startup(ctx context.Context) {
 	// Background scheduler that watches presets opted into AutoPull and
 	// enqueues jobs whenever the global interval has elapsed.
 	go g.schedulerLoop()
-	// System tray icon — runs on its own platform message loop via
-	// systray.RunWithExternalLoop so it coexists with Wails. The window
-	// close hook checks tray.IsQuitting() to differentiate "user pressed
-	// Выход in tray menu" from "user pressed X on the window".
-	g.tray = newTrayController(g)
-	g.tray.Start()
 	// If the user enabled "start minimized" in settings, hide the window
 	// after Wails finishes its startup so the app boots into the tray.
+	// The tray icon itself is started in main() before wails.Run() — see
+	// the comment there for why.
 	if loadAppSettings().StartMinimized {
 		go func() {
 			// Defer past startup so the runtime context is alive and
@@ -83,13 +77,10 @@ func (g *GUI) startup(ctx context.Context) {
 // shutdown is wired as the Wails OnShutdown callback; it flushes the most
 // recent session cookies to disk so the next launch sees what JR has
 // rotated to during this run, not whatever was current at login time.
-// Also tears down the tray icon so it disappears immediately on quit.
+// The tray icon is stopped in main() after wails.Run() returns.
 func (g *GUI) shutdown(_ context.Context) {
 	if g.sessionPath != "" {
 		_ = g.gql.SaveSession(g.sessionPath)
-	}
-	if g.tray != nil {
-		g.tray.Stop()
 	}
 }
 
@@ -102,7 +93,7 @@ func (g *GUI) shutdown(_ context.Context) {
 // Returning true tells Wails "I handled the close, do NOT proceed with
 // shutdown"; false lets the normal exit path run.
 func (g *GUI) onBeforeClose(_ context.Context) bool {
-	if g.tray != nil && g.tray.IsQuitting() {
+	if trayIsQuitting() {
 		return false
 	}
 	if !loadAppSettings().MinimizeToTrayOnClose {

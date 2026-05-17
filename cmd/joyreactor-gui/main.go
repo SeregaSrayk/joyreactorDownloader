@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 
 	"github.com/wailsapp/wails/v2"
@@ -21,6 +22,21 @@ func main() {
 	if ws.Maximized {
 		startState = options.Maximised
 	}
+
+	// Tray icon must be started on its own goroutine BEFORE wails.Run()
+	// — fyne.io/systray creates a hidden window for its message pump that
+	// must live on the same OS thread as the goroutine reading messages.
+	// Starting the tray inside the Wails OnStartup callback puts the HWND
+	// on a different thread and the click events disappear silently
+	// (verified empirically; the weightCounter app uses this same layout).
+	go startSystray(
+		func() context.Context { return gui.ctx },
+		func() {
+			if gui.ctx != nil {
+				wailsruntime.Quit(gui.ctx)
+			}
+		},
+	)
 
 	err := wails.Run(&options.App{
 		Title:            "Joyreactor Downloader",
@@ -68,4 +84,5 @@ func main() {
 	if err != nil {
 		println("wails error:", err.Error())
 	}
+	stopSystray()
 }

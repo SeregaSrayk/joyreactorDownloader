@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"runtime"
 	"sync"
@@ -15,117 +16,98 @@ var trayIconWin []byte
 //go:embed build/appicon.png
 var trayIconPng []byte
 
-// trayController owns the system tray icon + menu and bridges its events
-// into Wails window actions on the GUI struct. Created once at startup and
-// reused for the app's lifetime; reflects the current "active jobs" count
-// in its tooltip so the user knows what's happening when the window is
-// hidden.
-type trayController struct {
-	gui  *GUI
-	stop func()
-
+// trayState holds the bits the rest of the app needs to query about tray
+// behaviour — specifically, "did the user explicitly pick Выход in the
+// tray menu?" — so the window-close hook can tell apart "hide to tray"
+// from "actually quit".
+type trayState struct {
 	mu       sync.Mutex
-	started  bool
-	quitting bool // set true when user picked "Выход" — distinguishes
-	// graceful tray-quit from window-X (which we want to hide-to-tray).
+	quitting bool
 }
 
-func newTrayController(g *GUI) *trayController {
-	return &trayController{gui: g}
+var tray = &trayState{}
+
+// trayIsQuitting reports whether the tray's Выход menu item fired the
+// shutdown. The window-close hook reads this to decide hide-vs-quit.
+func trayIsQuitting() bool {
+	tray.mu.Lock()
+	defer tray.mu.Unlock()
+	return tray.quitting
 }
 
-// pickIcon returns the platform-appropriate icon bytes for the tray
+// pickTrayIcon returns the platform-appropriate icon bytes for the tray
 // renderer. fyne.io/systray expects .ico on Windows and .png elsewhere.
-func pickIcon() []byte {
+func pickTrayIcon() []byte {
 	if runtime.GOOS == "windows" {
 		return trayIconWin
 	}
 	return trayIconPng
 }
 
-// Start initializes the tray icon. Uses RunWithExternalLoop so the call
-// returns immediately and the Wails main loop can keep running on the
-// main goroutine. Safe to call multiple times — subsequent calls are no-op.
-func (t *trayController) Start() {
-	t.mu.Lock()
-	if t.started {
-		t.mu.Unlock()
-		return
-	}
-	t.started = true
-	t.mu.Unlock()
-
-	onReady := func() {
-		systray.SetIcon(pickIcon())
+// startSystray runs the tray icon on its own goroutine. Must be invoked
+// BEFORE wails.Run() — the working weightCounter app uses this layout,
+// and starting the tray after Wails leaves the HWND on the wrong OS
+// thread, making WM_LBUTTONUP / WM_RBUTTONUP events vanish.
+//
+// getCtx returns the Wails runtime context once it's available (nil
+// before startup completes); the tray callbacks tolerate a nil ctx by
+// no-oping until Wails wires it.
+//
+// onQuit is invoked when the user picks Выход in the tray menu — it
+// should mark quit-intent and tell Wails to shut down.
+func startSystray(getCtx func() context.Context, onQuit func()) {
+	systray.Run(func() {
+		systray.SetIcon(pickTrayIcon())
 		systray.SetTitle("Joyreactor Downloader")
 		systray.SetTooltip("Joyreactor Downloader")
 
-		// Left-click on the tray icon shows the window — that's the standard
-		// Windows tray-app behaviour ("click to bring app back to front").
-		// Right-click still opens the menu (handled by systray defaults).
-		systray.SetOnTapped(t.showWindow)
-
-		mShow := systray.AddMenuItem("Показать окно", "Развернуть основное окно")
+		showItem := systray.AddMenuItem("Показать окно", "Развернуть основное окно")
 		systray.AddSeparator()
-		mQuit := systray.AddMenuItem("Выход", "Закрыть приложение")
+		quitItem := systray.AddMenuItem("Выход", "Закрыть приложение")
+
+		// Left-click on the tray icon mirrors the menu's «Показать окно»
+		// item — standard Windows tray-app behaviour. Right-click still
+		// opens the contextual menu.
+		systray.SetOnTapped(func() {
+			ctx := getCtx()
+			if ctx == nil {
+				return
+			}
+			wailsruntime.WindowShow(ctx)
+			wailsruntime.WindowUnminimise(ctx)
+			wailsruntime.WindowSetAlwaysOnTop(ctx, true)
+			wailsruntime.WindowSetAlwaysOnTop(ctx, false)
+		})
 
 		go func() {
 			for {
 				select {
-				case <-mShow.ClickedCh:
-					t.showWindow()
-				case <-mQuit.ClickedCh:
-					t.mu.Lock()
-					t.quitting = true
-					t.mu.Unlock()
-					if t.gui.ctx != nil {
-						wailsruntime.Quit(t.gui.ctx)
+				case <-showItem.ClickedCh:
+					ctx := getCtx()
+					if ctx == nil {
+						continue
+					}
+					wailsruntime.WindowShow(ctx)
+					wailsruntime.WindowUnminimise(ctx)
+					wailsruntime.WindowSetAlwaysOnTop(ctx, true)
+					wailsruntime.WindowSetAlwaysOnTop(ctx, false)
+				case <-quitItem.ClickedCh:
+					tray.mu.Lock()
+					tray.quitting = true
+					tray.mu.Unlock()
+					if onQuit != nil {
+						onQuit()
 					}
 					return
 				}
 			}
 		}()
-	}
-	onExit := func() {}
-	start, stop := systray.RunWithExternalLoop(onReady, onExit)
-	t.stop = stop
-	start()
+	}, func() {})
 }
 
-// Stop tears down the tray. Called from the Wails OnShutdown hook so the
-// tray icon disappears as soon as the app exits.
-func (t *trayController) Stop() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if !t.started || t.stop == nil {
-		return
-	}
-	t.stop()
-	t.stop = nil
-	t.started = false
-}
-
-// IsQuitting reports whether the user clicked "Выход" in the tray menu.
-// Used by the window-close hook to decide between "hide to tray" and
-// "actually quit the process".
-func (t *trayController) IsQuitting() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.quitting
-}
-
-// showWindow brings the main window back from a hidden / minimized state
-// and focuses it. Called from the tray "Показать окно" menu item and the
-// left-click handler on the tray icon. The AlwaysOnTop flicker is the
-// documented Wails trick to force focus on Windows; without it WindowShow
-// only restores the window to its previous z-order, which may still be
-// behind everything else.
-func (t *trayController) showWindow() {
-	if t.gui == nil || t.gui.ctx == nil {
-		return
-	}
-	wailsruntime.WindowShow(t.gui.ctx)
-	wailsruntime.WindowUnminimise(t.gui.ctx)
-	wailsruntime.WindowSetAlwaysOnTop(t.gui.ctx, true)
-	wailsruntime.WindowSetAlwaysOnTop(t.gui.ctx, false)
+// stopSystray tears down the tray icon. Called after wails.Run() returns
+// so the icon disappears at process exit. systray.Quit is safe to call
+// even if Run hasn't started yet (it does nothing in that case).
+func stopSystray() {
+	systray.Quit()
 }
