@@ -15,6 +15,7 @@ import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime';
 
 const LS_SHOW_AUTHOR     = 'jrdl:showAuthor';
 const LS_SHOW_RATING     = 'jrdl:showRating';
+const LS_SHOW_PAGE_RANGE = 'jrdl:showPageRange';
 const LS_OUTDIR          = 'jrdl:outdir';
 const LS_FILENAME_FORMAT = 'jrdl:filenameFormat';
 const LS_PREVIEW_BATCH   = 'jrdl:previewBatch';
@@ -40,6 +41,7 @@ const state = {
   kinds: [],               // empty = any; subset of ['image','gif','video']
   showAuthor: lsBool(LS_SHOW_AUTHOR, false),
   showRating: lsBool(LS_SHOW_RATING, false),
+  showPageRange: lsBool(LS_SHOW_PAGE_RANGE, false),
   filenameFormat: lsStr(LS_FILENAME_FORMAT, 'id'),
   previewBatch: lsInt(LS_PREVIEW_BATCH, 25),  // posts to fetch per Найти / Загрузить ещё click
   settingsOpen: false,
@@ -288,10 +290,19 @@ function renderFiltersCard() {
           </div>
         </div>` : ''}
       <div class="field">
-        <label>Сортировка</label>
-        <div class="segmented" id="seg-sort">
-          <button data-v="rating" class="${state.sort === 'rating' ? 'active' : ''}">рейтинг</button>
-          <button data-v="date"   class="${state.sort === 'date'   ? 'active' : ''}">дата</button>
+        <label>Сортировка${state.showPageRange ? ' · диапазон страниц' : ''}</label>
+        <div class="sort-row">
+          <div class="segmented" id="seg-sort">
+            <button data-v="rating" class="${state.sort === 'rating' ? 'active' : ''}">рейтинг</button>
+            <button data-v="date"   class="${state.sort === 'date'   ? 'active' : ''}">дата</button>
+          </div>
+          ${state.showPageRange ? `
+            <div class="page-range" title="JR отдаёт ~10 постов на страницу. Пусто/0 = без ограничения с этой стороны.">
+              <input type="number" id="f-page-from" placeholder="с" min="1" aria-label="С какой страницы">
+              <span class="page-range-sep">—</span>
+              <input type="number" id="f-page-to"   placeholder="по" min="0" aria-label="По какую страницу">
+              <span class="muted">стр.</span>
+            </div>` : ''}
         </div>
       </div>
       <div class="field">
@@ -425,6 +436,10 @@ function renderSettingsModal() {
               <input type="checkbox" id="s-show-rating" ${state.showRating ? 'checked' : ''}>
               Поиск по рейтингу
             </label>
+            <label>
+              <input type="checkbox" id="s-show-page-range" ${state.showPageRange ? 'checked' : ''}>
+              Диапазон страниц поиска
+            </label>
           </div>
         </div>
 
@@ -478,22 +493,6 @@ function renderSettingsModal() {
               <label>Параллельных загрузок</label>
               <input type="number" id="f-workers" value="4" min="1" max="16">
             </div>
-          </div>
-          <div class="row">
-            <div class="field">
-              <label>Со страницы</label>
-              <input type="number" id="f-page-from" placeholder="1" min="1">
-            </div>
-            <div class="field">
-              <label>До страницы (включительно)</label>
-              <input type="number" id="f-page-to" placeholder="0 = до конца" min="0">
-            </div>
-          </div>
-          <div class="field-hint">
-            JR отдаёт ~10 постов на странице. По умолчанию пагинация идёт
-            от 1 до последней. «Со страницы 51» — пропустить первые 50
-            (≈500 постов уже скачано). «До страницы 100» — остановиться
-            после неё. Полезно для resume или для нарезки на сегменты.
           </div>
         </div>
 
@@ -1085,6 +1084,12 @@ function wireEvents() {
     captureInputs();
     render();
   });
+  $('#s-show-page-range')?.addEventListener('change', e => {
+    state.showPageRange = e.target.checked;
+    localStorage.setItem(LS_SHOW_PAGE_RANGE, e.target.checked ? '1' : '0');
+    captureInputs();
+    render();
+  });
   $('#s-preview-batch')?.addEventListener('change', e => {
     const n = parseInt(e.target.value, 10);
     if (Number.isFinite(n) && n > 0) {
@@ -1608,9 +1613,11 @@ async function doSearch(reset) {
   hideToast();
   // Honour the user's PageFrom/PageTo for the preview too — start at
   // PageFrom on a fresh search so what's shown lines up with what would
-  // actually be downloaded.
-  const pageFrom = parseStoredInt('f-page-from', 0);
-  const pageTo   = parseStoredInt('f-page-to',   0);
+  // actually be downloaded. The range is only active when the user has
+  // turned on "Диапазон страниц поиска" in Settings; otherwise the
+  // stale inputs (if hidden but still in formInputs) are ignored.
+  const pageFrom = state.showPageRange ? parseStoredInt('f-page-from', 0) : 0;
+  const pageTo   = state.showPageRange ? parseStoredInt('f-page-to',   0) : 0;
   if (reset) {
     state.results = [];
     state.count = null;
@@ -1705,8 +1712,8 @@ async function doAddJob() {
     dateTo:    state.formInputs['f-to'] || '',
     limit:     parseStoredInt('f-limit', 0),
     workers:   parseStoredInt('f-workers', 4) || 4,
-    pageFrom:  parseStoredInt('f-page-from', 0),
-    pageTo:    parseStoredInt('f-page-to', 0),
+    pageFrom:  state.showPageRange ? parseStoredInt('f-page-from', 0) : 0,
+    pageTo:    state.showPageRange ? parseStoredInt('f-page-to',   0) : 0,
     filenameFormat: state.filenameFormat || 'id',
     outDir,
     ...(selectedItems ? { selectedItems } : {}),
