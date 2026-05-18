@@ -20,6 +20,7 @@ cmd/joyreactor-gui/frontend/wailsjs/
 # CLAUDE.md and (optionally) .claude/settings.json are the team-shared bits;
 # settings.local.json is personal and should not be pushed.
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Throwaway screenshots from scripts/screenshot.ps1 + ad-hoc crops created
 # during UI smoke tests. The folder itself stays tracked via .gitkeep so
