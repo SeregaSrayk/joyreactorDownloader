@@ -1,6 +1,9 @@
 package graphql
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type ImageType string
 
@@ -92,9 +95,18 @@ type Post struct {
 	CreatedAt  time.Time   `json:"createdAt"`
 	NSFW       bool        `json:"nsfw"`
 	Unsafe     bool        `json:"unsafe"`
+	Text       string      `json:"text"`
 	User       User        `json:"user"`
 	Tags       []Tag       `json:"tags"`
 	Attributes []Attribute `json:"attributes"`
+}
+
+// IsRemoved reports whether the post was taken down (DMCA / copyright complaint).
+// JR's tell: the text body is replaced with a /censorship/ placeholder image and
+// the attributes array is emptied. Thumbnail still works because it's generated
+// from the post id, not regenerated when the content is removed.
+func (p Post) IsRemoved() bool {
+	return len(p.Attributes) == 0 && strings.Contains(p.Text, "/censorship/")
 }
 
 type PostPager struct {

@@ -573,6 +573,32 @@ input[type="checkbox"] {
   outline-offset: -3px;
 }
 
+/* DMCA-removed posts: thumbnail still renders so the user knows what they
+   missed, but a dimming overlay + watermark makes it unmistakable that the
+   actual images are gone and not downloadable. */
+.tile.is-removed img { filter: grayscale(1) brightness(.45); }
+.tile-removed {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  pointer-events: none;
+  color: #fff;
+  text-shadow: 0 1px 4px rgba(0,0,0,.85);
+}
+.tile-removed-icon { font-size: 38px; line-height: 1; }
+.tile-removed-text {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  text-align: center;
+  line-height: 1.25;
+}
+
 /* Rubber-band marquee shown while LMB-dragging in manual-select mode. */
 .marquee {
   position: fixed;

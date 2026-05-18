@@ -6,7 +6,7 @@ import (
 )
 
 const postFields = `
-  id rating createdAt nsfw unsafe
+  id rating createdAt nsfw unsafe text
   user { username }
   tags { name seoName mainTag { name } }
   attributes {

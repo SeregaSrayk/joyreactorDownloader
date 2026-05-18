@@ -61,7 +61,7 @@ const state = {
   blockedCount: 0,
   postModal: null,   // { post, comments, loading, error } when the right-click preview is open
   windowSettings: { width: 1180, height: 820, maximized: false },
-  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false },
+  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false, hideRemovedPosts: true },
   downloaded: { outDir: '', keys: new Set() },  // attr IDs in the current outdir's .manifest.json
   selectedPosts: new Set(),  // postId strings the user manually picked for selective download
   manualSelect: lsBool(LS_MANUAL_SELECT, false),  // master toggle for the per-tile checkbox UI
@@ -470,6 +470,22 @@ function renderSettingsModal() {
         </div>
 
         <div class="settings-section">
+          <h4>Превью</h4>
+          <div class="toggles">
+            <label>
+              <input type="checkbox" id="s-hide-removed" ${state.appSettings.hideRemovedPosts !== false ? 'checked' : ''}>
+              Скрывать удалённые посты
+            </label>
+          </div>
+          <div class="field-hint">
+            Посты, удалённые с JR по жалобе на копирайт. Картинки физически
+            недоступны — остаётся только превьюшка. Когда галка снята, такие
+            посты показываются в гриде с серой ватермаркой «🚫 удалено», но
+            скачать их всё равно нельзя.
+          </div>
+        </div>
+
+        <div class="settings-section">
           <h4>Авто-обновление пресетов</h4>
           <div class="field">
             <label>Глобальный интервал между авто-обновлениями (часы)</label>
@@ -793,19 +809,27 @@ function renderTile(p) {
   const nsfwBadge = p.nsfw ? `<div class="tile-badge tile-nsfw">NSFW</div>` : '';
   const kindBadge = kind  ? `<div class="tile-badge tile-kind">${kind}</div>`  : '';
   // tile-select appears only when "Ручное скачивание" is on AND the post
-  // isn't already fully downloaded. The left-corner green check already
-  // signals "downloaded", so hiding the right-corner checkbox keeps the UI
-  // uncluttered. stopPropagation in the handler keeps the tile body's
-  // open-preview click from firing.
-  const selectBtn = (state.manualSelect && !fullyDownloaded)
+  // isn't already fully downloaded. Also hidden for removed posts — there's
+  // nothing to download. The left-corner green check already signals
+  // "downloaded", so hiding the right-corner checkbox keeps the UI uncluttered.
+  // stopPropagation in the handler keeps the tile body's open-preview click
+  // from firing.
+  const selectBtn = (state.manualSelect && !fullyDownloaded && !p.removed)
     ? `<button class="tile-select ${selected ? 'on' : ''}"
               data-post-id="${escape(p.postId)}"
               title="${selected ? 'Убрать из выбора' : 'Добавить в выбранные'}"
               aria-pressed="${selected ? 'true' : 'false'}">${selected ? '✓' : ''}</button>`
     : '';
+  const removedOverlay = p.removed
+    ? `<div class="tile-removed" title="Пост удалён по жалобе на копирайт — картинки недоступны">
+         <div class="tile-removed-icon">🚫</div>
+         <div class="tile-removed-text">удалено<br>по копирайту</div>
+       </div>`
+    : '';
   return `
-    <div class="tile ${selected ? 'selected' : ''}" data-post="${p.postNum}" data-post-id="${escape(p.postId)}" title="${escape(tags)}">
+    <div class="tile ${selected ? 'selected' : ''} ${p.removed ? 'is-removed' : ''}" data-post="${p.postNum}" data-post-id="${escape(p.postId)}" title="${escape(tags)}">
       ${thumb ? `<img src="${escape(thumb)}" loading="lazy" alt="" draggable="false">` : '<div class="tile-empty">нет превью</div>'}
+      ${removedOverlay}
       <div class="tile-corner left">
         ${haveBadge}
         ${countBadge}
@@ -1289,6 +1313,10 @@ function wireEvents() {
   });
   $('#s-min-on-close')?.addEventListener('change', async e => {
     state.appSettings.minimizeToTrayOnClose = e.target.checked;
+    await pushAppSettings();
+  });
+  $('#s-hide-removed')?.addEventListener('change', async e => {
+    state.appSettings.hideRemovedPosts = e.target.checked;
     await pushAppSettings();
   });
   $('#s-autopull-interval')?.addEventListener('change', async e => {
@@ -2456,6 +2484,8 @@ document.addEventListener('visibilitychange', () => {
       state.appSettings.autostart = !!app.autostart;
       state.appSettings.startMinimized = !!app.startMinimized;
       state.appSettings.minimizeToTrayOnClose = !!app.minimizeToTrayOnClose;
+      // Absent (legacy settings.json) ⇒ stay with the default true.
+      state.appSettings.hideRemovedPosts = app.hideRemovedPosts == null ? true : !!app.hideRemovedPosts;
     }
   } catch {}
   await refreshPresets();

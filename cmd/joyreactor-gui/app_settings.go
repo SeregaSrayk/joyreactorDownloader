@@ -39,6 +39,22 @@ type AppSettings struct {
 	// hides the window to tray instead of quitting the app. The tray icon's
 	// "Выход" menu item still quits explicitly.
 	MinimizeToTrayOnClose bool `json:"minimizeToTrayOnClose"`
+
+	// HideRemovedPosts — when true (default), DMCA-takedown stubs are filtered
+	// out of search-preview results. Pointer so an absent field in legacy
+	// settings.json reads as nil ≡ "use default true", letting us flip the
+	// default in the future without forcing every existing user back to it.
+	HideRemovedPosts *bool `json:"hideRemovedPosts,omitempty"`
+}
+
+// HideRemoved resolves the optional pointer to a concrete bool using the
+// "default true" rule. Call this everywhere instead of dereferencing the
+// pointer manually.
+func (s AppSettings) HideRemoved() bool {
+	if s.HideRemovedPosts == nil {
+		return true
+	}
+	return *s.HideRemovedPosts
 }
 
 func defaultAppSettings() AppSettings {
@@ -92,6 +108,7 @@ func loadAppSettings() AppSettings {
 	s.Autostart = loaded.Autostart
 	s.StartMinimized = loaded.StartMinimized
 	s.MinimizeToTrayOnClose = loaded.MinimizeToTrayOnClose
+	s.HideRemovedPosts = loaded.HideRemovedPosts
 	return s
 }
 

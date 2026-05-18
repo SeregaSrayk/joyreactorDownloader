@@ -321,6 +321,7 @@ type Preview struct {
 	Rating       float64   `json:"rating"`
 	CreatedAt    string    `json:"createdAt"`
 	NSFW         bool      `json:"nsfw"`
+	Removed      bool      `json:"removed"` // DMCA / takedown — pictures unavailable
 	Author       string    `json:"author"`
 	Tags         []string  `json:"tags"`
 	ThumbnailURL string    `json:"thumbnailUrl"`
@@ -340,6 +341,7 @@ type Picture struct {
 
 func (g *GUI) Search(in SearchInput) SearchOutput {
 	c := g.mergeBlockedTags(criteriaFromSearch(in), in.UseBlockedTags)
+	hideRemoved := loadAppSettings().HideRemoved()
 	page := in.Page
 	if page < 1 {
 		page = 1
@@ -364,6 +366,10 @@ func (g *GUI) Search(in SearchInput) SearchOutput {
 		if !c.MatchPostTags(tagNamesForMatching(p)) {
 			continue
 		}
+		removed := p.IsRemoved()
+		if removed && hideRemoved {
+			continue
+		}
 		thumb, _ := p.ThumbnailURL()
 		_, postNum, _ := graphql.DecodeID(p.ID)
 		prev := Preview{
@@ -372,6 +378,7 @@ func (g *GUI) Search(in SearchInput) SearchOutput {
 			Rating:       p.Rating,
 			CreatedAt:    p.CreatedAt.Format(time.RFC3339),
 			NSFW:         p.NSFW,
+			Removed:      removed,
 			Author:       p.User.Username,
 			Tags:         tagNames(p),
 			ThumbnailURL: thumb,
@@ -723,6 +730,9 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 			return nil
 		}
 		for _, p := range res.PostPager.Posts {
+			if p.IsRemoved() {
+				continue
+			}
 			if !c.MatchPostDate(p.CreatedAt) {
 				continue
 			}
