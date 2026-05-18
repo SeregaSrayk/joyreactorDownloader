@@ -599,6 +599,24 @@ input[type="checkbox"] {
   line-height: 1.25;
 }
 
+/* Network-test result pill next to the "Проверить" button in settings. */
+.net-test-result {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.3;
+  border: 1px solid transparent;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.net-test-result.ok  { background: rgba(34, 197, 94, .15);  color: #4ade80; border-color: rgba(34, 197, 94, .35); }
+.net-test-result.err { background: rgba(220, 38, 38, .15);  color: #fca5a5; border-color: rgba(220, 38, 38, .35); }
+
 /* Rubber-band marquee shown while LMB-dragging in manual-select mode. */
 .marquee {
   position: fixed;

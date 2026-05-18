@@ -43,7 +43,7 @@ func NewGUI() *GUI { return &GUI{} }
 
 func (g *GUI) startup(ctx context.Context) {
 	g.ctx = ctx
-	g.gql = graphql.NewClient("")
+	g.gql = buildGqlClient(loadAppSettings())
 	g.httpc = client.New()
 	g.sessionPath = sessionFilePath()
 	g.presets = loadPresets()

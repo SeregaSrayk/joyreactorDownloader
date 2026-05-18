@@ -27,12 +27,29 @@ type Client struct {
 }
 
 func NewClient(endpoint string) *Client {
+	return NewClientWithTransport(endpoint, nil)
+}
+
+// NewClientWithTransport is the SOCKS5/Tor-friendly constructor: pass a custom
+// http.RoundTripper (e.g. one whose DialContext goes through a SOCKS5 dialer)
+// and the cookie jar / throttling / retry behaviour stays identical to a
+// regular Client. Pass nil transport for the default behaviour.
+//
+// The timeout is larger here (60s instead of 30s) because Tor circuits add a
+// few hundred ms baseline latency and rendezvous to a hidden service can take
+// noticeably longer than a clearnet TCP+TLS handshake.
+func NewClientWithTransport(endpoint string, transport http.RoundTripper) *Client {
 	if endpoint == "" {
 		endpoint = DefaultEndpoint
 	}
 	jar, _ := cookiejar.New(nil) // cookiejar.New never errors when opts is nil
+	hc := &http.Client{Timeout: 30 * time.Second, Jar: jar}
+	if transport != nil {
+		hc.Transport = transport
+		hc.Timeout = 60 * time.Second
+	}
 	return &Client{
-		http:     &http.Client{Timeout: 30 * time.Second, Jar: jar},
+		http:     hc,
 		endpoint: endpoint,
 		ua:       "joyreactor-dl/0.1",
 		minDelay: 500 * time.Millisecond,

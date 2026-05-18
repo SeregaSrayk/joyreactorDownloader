@@ -10,6 +10,7 @@ import {
   ManifestKeys, OpenManifestFolder, DeleteManifest,
   TagSuggest, CheckUser, SuggestUsers, BlockedTagCount,
   PostComments,
+  TestNetwork,
 } from '../wailsjs/go/main/GUI';
 import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime';
 
@@ -61,7 +62,10 @@ const state = {
   blockedCount: 0,
   postModal: null,   // { post, comments, loading, error } when the right-click preview is open
   windowSettings: { width: 1180, height: 820, maximized: false },
-  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false, hideRemovedPosts: true },
+  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false, hideRemovedPosts: true, socks5Enabled: false, socks5Addr: '', graphqlEndpoint: '' },
+  // Last network-test result, shown next to the "Проверить" button until the
+  // user changes any field. {state:'idle'|'testing'|'ok'|'error', text:'...'}.
+  networkTest: { state: 'idle' },
   downloaded: { outDir: '', keys: new Set() },  // attr IDs in the current outdir's .manifest.json
   selectedPosts: new Set(),  // postId strings the user manually picked for selective download
   manualSelect: lsBool(LS_MANUAL_SELECT, false),  // master toggle for the per-tile checkbox UI
@@ -532,6 +536,50 @@ function renderSettingsModal() {
             <button class="btn small danger" id="btn-delete-manifest" title="Удалить файл манифеста — все картинки снова будут считаться нескачанными">
               🗑️ Удалить манифест
             </button>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h4>Сеть</h4>
+          <div class="toggles">
+            <label>
+              <input type="checkbox" id="s-socks5-enabled" ${state.appSettings.socks5Enabled ? 'checked' : ''}>
+              Использовать SOCKS5-прокси для GraphQL (Tor)
+            </label>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>SOCKS5 адрес (host:port)</label>
+              <input type="text" id="s-socks5-addr" placeholder="127.0.0.1:9150"
+                     value="${escape(state.appSettings.socks5Addr || '')}">
+              <div class="field-hint">
+                Tor Browser — <code>127.0.0.1:9150</code>, отдельный tor daemon — <code>127.0.0.1:9050</code>.
+              </div>
+            </div>
+            <div class="field">
+              <label>GraphQL эндпоинт</label>
+              <input type="text" id="s-gql-endpoint" placeholder="https://api.joyreactor.cc/graphql"
+                     value="${escape(state.appSettings.graphqlEndpoint || '')}">
+              <div class="field-hint">
+                Пусто = клирнет. Для .onion-зеркала JR — кнопка ниже подставит готовый URL.
+              </div>
+            </div>
+          </div>
+          <div class="actions-row">
+            <button class="btn small" id="btn-fill-onion" title="Подставить адрес .onion-зеркала JR (нужен SOCKS5+Tor)">
+              🧅 Подставить .onion
+            </button>
+            <button class="btn small" id="btn-test-network" title="Проверить связь с настроенным эндпоинтом">
+              ${state.networkTest.state === 'testing' ? '⏳ Проверяю…' : '🔌 Проверить'}
+            </button>
+            ${renderNetworkTestResult()}
+          </div>
+          <div class="field-hint">
+            CDN-скачивание (картинки) всегда идёт по клирнету — Tor для медиа
+            и медленно, и так не нужен (на CDN нет гео-блока). Через прокси
+            ходит только GraphQL — метаданные постов. Tor мы не поставляем,
+            поставь его сам (Tor Browser или <code>tor</code> daemon). После
+            смены настроек — перезапусти приложение, чтобы применилось.
           </div>
         </div>
 
@@ -1137,6 +1185,16 @@ function chip(text, kind, i) {
   return `<span class="chip">${escape(text)}<button data-kind="${kind}" data-i="${i}" title="убрать">×</button></span>`;
 }
 
+// renderNetworkTestResult — small status pill next to the "Проверить" button.
+function renderNetworkTestResult() {
+  const t = state.networkTest;
+  if (t.state === 'idle' || t.state === 'testing') return '';
+  const cls = t.state === 'ok' ? 'ok' : 'err';
+  return `<span class="net-test-result ${cls}">${escape(t.text || '')}</span>`;
+}
+
+const DEFAULT_ONION_GQL = 'http://reactorccdnf36aqvq34zbfzqyrcrpg3eyhilauovitrvmcjovsujmid.onion/graphql';
+
 // ----- Input preservation across re-renders -----
 // All known input ids — only those present in the current DOM are captured/restored.
 const inputIds = ['f-query','f-user','f-min-rating','f-max-rating','f-nsfw','f-only-nsfw','f-unsafe','f-favorite','f-use-blocked','f-min-width','f-min-height','f-from','f-to','f-limit','f-workers','f-page-from','f-page-to','f-outdir'];
@@ -1318,6 +1376,62 @@ function wireEvents() {
   $('#s-hide-removed')?.addEventListener('change', async e => {
     state.appSettings.hideRemovedPosts = e.target.checked;
     await pushAppSettings();
+  });
+  $('#s-socks5-enabled')?.addEventListener('change', async e => {
+    state.appSettings.socks5Enabled = e.target.checked;
+    // Pre-fill the address on first enable so the user has a sane default to
+    // start from. Leave it alone on subsequent toggles in case they already
+    // customized it.
+    if (e.target.checked && !state.appSettings.socks5Addr) {
+      state.appSettings.socks5Addr = '127.0.0.1:9150';
+    }
+    state.networkTest = { state: 'idle' };
+    await pushAppSettings();
+    render({ skipCapture: true });
+  });
+  // Save on blur (or Enter) rather than every keystroke — typing into
+  // host:port shouldn't trigger 50 disk writes.
+  const persistOnCommit = (id, key) => {
+    const commit = e => {
+      const next = e.target.value.trim();
+      if (state.appSettings[key] === next) return;
+      state.appSettings[key] = next;
+      state.networkTest = { state: 'idle' };
+      pushAppSettings();
+      render({ skipCapture: true });
+    };
+    $('#' + id)?.addEventListener('blur', commit);
+    $('#' + id)?.addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+  };
+  persistOnCommit('s-socks5-addr', 'socks5Addr');
+  persistOnCommit('s-gql-endpoint', 'graphqlEndpoint');
+
+  $('#btn-fill-onion')?.addEventListener('click', async () => {
+    state.appSettings.graphqlEndpoint = DEFAULT_ONION_GQL;
+    state.networkTest = { state: 'idle' };
+    await pushAppSettings();
+    render({ skipCapture: true });
+  });
+
+  $('#btn-test-network')?.addEventListener('click', async () => {
+    if (state.networkTest.state === 'testing') return;
+    state.networkTest = { state: 'testing' };
+    render({ skipCapture: true });
+    try {
+      const r = await TestNetwork(
+        !!state.appSettings.socks5Enabled,
+        state.appSettings.socks5Addr || '',
+        state.appSettings.graphqlEndpoint || '',
+      );
+      if (r.ok) {
+        state.networkTest = { state: 'ok', text: `OK · ${r.latencyMs} мс · ${r.address}` };
+      } else {
+        state.networkTest = { state: 'err', text: r.error || 'неизвестная ошибка' };
+      }
+    } catch (e) {
+      state.networkTest = { state: 'err', text: String(e?.message || e) };
+    }
+    render({ skipCapture: true });
   });
   $('#s-autopull-interval')?.addEventListener('change', async e => {
     const n = parseInt(e.target.value, 10);
@@ -2486,6 +2600,9 @@ document.addEventListener('visibilitychange', () => {
       state.appSettings.minimizeToTrayOnClose = !!app.minimizeToTrayOnClose;
       // Absent (legacy settings.json) ⇒ stay with the default true.
       state.appSettings.hideRemovedPosts = app.hideRemovedPosts == null ? true : !!app.hideRemovedPosts;
+      state.appSettings.socks5Enabled = !!app.socks5Enabled;
+      state.appSettings.socks5Addr = app.socks5Addr || '';
+      state.appSettings.graphqlEndpoint = app.graphqlEndpoint || '';
     }
   } catch {}
   await refreshPresets();

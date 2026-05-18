@@ -45,6 +45,22 @@ type AppSettings struct {
 	// settings.json reads as nil ≡ "use default true", letting us flip the
 	// default in the future without forcing every existing user back to it.
 	HideRemovedPosts *bool `json:"hideRemovedPosts,omitempty"`
+
+	// Socks5Enabled routes GraphQL traffic through a user-provided SOCKS5
+	// proxy (typically Tor Browser or a tor daemon running on localhost).
+	// CDN downloads stay on clearnet — only metadata requests get tunneled.
+	// Off by default; we don't ship Tor, the user installs it themselves.
+	Socks5Enabled bool `json:"socks5Enabled,omitempty"`
+
+	// Socks5Addr is the host:port of the local SOCKS5 listener. Tor Browser
+	// uses 127.0.0.1:9150, the standalone tor daemon uses 9050.
+	Socks5Addr string `json:"socks5Addr,omitempty"`
+
+	// GraphQLEndpoint overrides the default api.joyreactor.cc URL. The
+	// reason to change it is the JR .onion mirror, which serves its own
+	// backend with looser filters when reached over Tor. Empty ⇒ clearnet
+	// default.
+	GraphQLEndpoint string `json:"graphqlEndpoint,omitempty"`
 }
 
 // HideRemoved resolves the optional pointer to a concrete bool using the
@@ -56,6 +72,15 @@ func (s AppSettings) HideRemoved() bool {
 	}
 	return *s.HideRemovedPosts
 }
+
+// DefaultSocks5Addr is the address pre-filled in the settings UI. Tor Browser's
+// embedded tor listens here; the standalone tor daemon uses :9050.
+const DefaultSocks5Addr = "127.0.0.1:9150"
+
+// DefaultOnionEndpoint is the JR .onion mirror's GraphQL URL. Pre-filled in
+// the settings UI when the user enables SOCKS5, since that's the main reason
+// someone would route GraphQL through Tor.
+const DefaultOnionEndpoint = "http://reactorccdnf36aqvq34zbfzqyrcrpg3eyhilauovitrvmcjovsujmid.onion/graphql"
 
 func defaultAppSettings() AppSettings {
 	return AppSettings{
@@ -109,6 +134,9 @@ func loadAppSettings() AppSettings {
 	s.StartMinimized = loaded.StartMinimized
 	s.MinimizeToTrayOnClose = loaded.MinimizeToTrayOnClose
 	s.HideRemovedPosts = loaded.HideRemovedPosts
+	s.Socks5Enabled = loaded.Socks5Enabled
+	s.Socks5Addr = loaded.Socks5Addr
+	s.GraphQLEndpoint = loaded.GraphQLEndpoint
 	return s
 }
 
