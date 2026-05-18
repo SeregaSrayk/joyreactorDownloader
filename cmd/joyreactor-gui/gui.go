@@ -341,7 +341,8 @@ type Picture struct {
 
 func (g *GUI) Search(in SearchInput) SearchOutput {
 	c := g.mergeBlockedTags(criteriaFromSearch(in), in.UseBlockedTags)
-	hideRemoved := loadAppSettings().HideRemoved()
+	settings := loadAppSettings()
+	hideRemoved := settings.HideRemoved()
 	page := in.Page
 	if page < 1 {
 		page = 1
@@ -356,6 +357,11 @@ func (g *GUI) Search(in SearchInput) SearchOutput {
 
 	out := SearchOutput{Count: res.PostPager.Count}
 	authors := make([]string, 0, len(res.PostPager.Posts))
+	// Indices (within out.Posts) of removed previews we'll try to recover.
+	// Collected in the main pass so we can run all onion fetches concurrently
+	// after the cheap clearnet pass is done.
+	var removedIdx []int
+	var removedPosts []graphql.Post
 	for _, p := range res.PostPager.Posts {
 		if p.User.Username != "" {
 			authors = append(authors, p.User.Username)
@@ -367,7 +373,17 @@ func (g *GUI) Search(in SearchInput) SearchOutput {
 			continue
 		}
 		removed := p.IsRemoved()
-		if removed && hideRemoved {
+		// Recovery needs all three: opted in, mirror URL, and a working
+		// SOCKS5 transport (since the mirror is a .onion the OS can't
+		// resolve directly). Missing any one ⇒ fall through to the regular
+		// "removed" presentation.
+		recoveryActive := removed &&
+			settings.RecoverDmcaViaOnion &&
+			settings.OnionBaseURL != "" &&
+			settings.Socks5Enabled
+		// Hide-removed only kicks in when we have no chance of recovering —
+		// otherwise we'd drop posts that we're about to fill in successfully.
+		if removed && hideRemoved && !recoveryActive {
 			continue
 		}
 		thumb, _ := p.ThumbnailURL()
@@ -390,6 +406,25 @@ func (g *GUI) Search(in SearchInput) SearchOutput {
 			}
 		}
 		out.Posts = append(out.Posts, prev)
+		if recoveryActive {
+			removedIdx = append(removedIdx, len(out.Posts)-1)
+			removedPosts = append(removedPosts, p)
+		}
+	}
+	if len(removedIdx) > 0 {
+		g.recoverViaOnion(out.Posts, removedIdx, removedPosts, settings, hideRemoved)
+		// Filter out removed-and-still-unrecoverable posts when hideRemoved
+		// is on. Doing it post-recovery keeps successful rescues visible.
+		if hideRemoved {
+			kept := out.Posts[:0]
+			for _, p := range out.Posts {
+				if p.Removed {
+					continue
+				}
+				kept = append(kept, p)
+			}
+			out.Posts = kept
+		}
 	}
 	if g.authors != nil {
 		g.authors.RecordBatch(authors)

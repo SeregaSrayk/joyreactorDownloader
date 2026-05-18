@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // AppSettings - application-wide preferences persisted to
@@ -56,11 +57,19 @@ type AppSettings struct {
 	// uses 127.0.0.1:9150, the standalone tor daemon uses 9050.
 	Socks5Addr string `json:"socks5Addr,omitempty"`
 
-	// GraphQLEndpoint overrides the default api.joyreactor.cc URL. The
-	// reason to change it is the JR .onion mirror, which serves its own
-	// backend with looser filters when reached over Tor. Empty ⇒ clearnet
-	// default.
-	GraphQLEndpoint string `json:"graphqlEndpoint,omitempty"`
+	// OnionBaseURL is the base URL of a JR .onion mirror (without trailing
+	// slash, e.g. http://reactorccdnf...onion). It's used for two things:
+	// (a) the TestNetwork probe, (b) DMCA-recovery HTML scraping at
+	// "<base>/post/<id>". Empty ⇒ no recovery; clearnet GraphQL stays the
+	// only metadata source.
+	OnionBaseURL string `json:"onionBaseURL,omitempty"`
+
+	// RecoverDmcaViaOnion, when true AND Socks5Enabled AND OnionBaseURL set,
+	// makes Search() try to recover DMCA-stubbed posts by scraping the onion
+	// mirror's HTML and downloading the orphaned files from clearnet CDN.
+	// Default false — opt-in because it costs an extra Tor round-trip per
+	// removed post in the search result.
+	RecoverDmcaViaOnion bool `json:"recoverDmcaViaOnion,omitempty"`
 }
 
 // HideRemoved resolves the optional pointer to a concrete bool using the
@@ -77,10 +86,10 @@ func (s AppSettings) HideRemoved() bool {
 // embedded tor listens here; the standalone tor daemon uses :9050.
 const DefaultSocks5Addr = "127.0.0.1:9150"
 
-// DefaultOnionEndpoint is the JR .onion mirror's GraphQL URL. Pre-filled in
-// the settings UI when the user enables SOCKS5, since that's the main reason
-// someone would route GraphQL through Tor.
-const DefaultOnionEndpoint = "http://reactorccdnf36aqvq34zbfzqyrcrpg3eyhilauovitrvmcjovsujmid.onion/graphql"
+// DefaultOnionBaseURL is the JR .onion mirror root (no trailing slash). HTML
+// scraping appends "/post/<id>". Pre-filled when the user clicks
+// "Подставить .onion" in the network settings.
+const DefaultOnionBaseURL = "http://reactorccdnf36aqvq34zbfzqyrcrpg3eyhilauovitrvmcjovsujmid.onion"
 
 func defaultAppSettings() AppSettings {
 	return AppSettings{
@@ -136,7 +145,16 @@ func loadAppSettings() AppSettings {
 	s.HideRemovedPosts = loaded.HideRemovedPosts
 	s.Socks5Enabled = loaded.Socks5Enabled
 	s.Socks5Addr = loaded.Socks5Addr
-	s.GraphQLEndpoint = loaded.GraphQLEndpoint
+	s.OnionBaseURL = loaded.OnionBaseURL
+	s.RecoverDmcaViaOnion = loaded.RecoverDmcaViaOnion
+	// Legacy migration: earlier builds called this field GraphQLEndpoint and
+	// pre-filled it with "...onion/graphql". The new semantics is "base URL"
+	// (no path), so trim the obsolete suffix on first load. Cheap to do
+	// unconditionally — clearnet GraphQL URLs also end with /graphql and
+	// stripping them just yields the bare api host, which is still wrong
+	// to use as a mirror base, but the user can just clear the field.
+	s.OnionBaseURL = strings.TrimSuffix(s.OnionBaseURL, "/graphql")
+	s.OnionBaseURL = strings.TrimRight(s.OnionBaseURL, "/")
 	return s
 }
 

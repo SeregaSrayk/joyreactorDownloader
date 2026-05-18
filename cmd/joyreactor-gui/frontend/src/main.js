@@ -62,7 +62,7 @@ const state = {
   blockedCount: 0,
   postModal: null,   // { post, comments, loading, error } when the right-click preview is open
   windowSettings: { width: 1180, height: 820, maximized: false },
-  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false, hideRemovedPosts: true, socks5Enabled: false, socks5Addr: '', graphqlEndpoint: '' },
+  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false, hideRemovedPosts: true, socks5Enabled: false, socks5Addr: '', onionBaseURL: '', recoverDmcaViaOnion: false },
   // Last network-test result, shown next to the "Проверить" button until the
   // user changes any field. {state:'idle'|'testing'|'ok'|'error', text:'...'}.
   networkTest: { state: 'idle' },
@@ -557,13 +557,23 @@ function renderSettingsModal() {
               </div>
             </div>
             <div class="field">
-              <label>GraphQL эндпоинт</label>
-              <input type="text" id="s-gql-endpoint" placeholder="https://api.joyreactor.cc/graphql"
-                     value="${escape(state.appSettings.graphqlEndpoint || '')}">
+              <label>.onion-зеркало JR (базовый URL)</label>
+              <input type="text" id="s-onion-base" placeholder="http://reactorccdnf...onion"
+                     value="${escape(state.appSettings.onionBaseURL || '')}">
               <div class="field-hint">
-                Пусто = клирнет. Для .onion-зеркала JR — кнопка ниже подставит готовый URL.
+                Используется для восстановления удалённых постов через
+                HTML-скрапинг <code>&lt;onion&gt;/post/&lt;id&gt;</code>.
               </div>
             </div>
+          </div>
+          <div class="toggles">
+            <label class="${state.appSettings.socks5Enabled && state.appSettings.onionBaseURL ? '' : 'disabled'}"
+                   title="${state.appSettings.socks5Enabled && state.appSettings.onionBaseURL ? '' : 'нужны SOCKS5 + URL зеркала'}">
+              <input type="checkbox" id="s-recover-dmca"
+                     ${state.appSettings.recoverDmcaViaOnion ? 'checked' : ''}
+                     ${state.appSettings.socks5Enabled && state.appSettings.onionBaseURL ? '' : 'disabled'}>
+              Восстанавливать удалённые посты через .onion-зеркало
+            </label>
           </div>
           <div class="actions-row">
             <button class="btn small" id="btn-fill-onion" title="Подставить адрес .onion-зеркала JR (нужен SOCKS5+Tor)">
@@ -575,11 +585,13 @@ function renderSettingsModal() {
             ${renderNetworkTestResult()}
           </div>
           <div class="field-hint">
-            CDN-скачивание (картинки) всегда идёт по клирнету — Tor для медиа
-            и медленно, и так не нужен (на CDN нет гео-блока). Через прокси
-            ходит только GraphQL — метаданные постов. Tor мы не поставляем,
-            поставь его сам (Tor Browser или <code>tor</code> daemon). После
-            смены настроек — перезапусти приложение, чтобы применилось.
+            Скачивание файлов всегда идёт напрямую — прокси нужен только для
+            метаданных (GraphQL) и для HTML-скрапинга зеркала. Удалённые по
+            DMCA посты восстанавливаются так: зеркало хранит метаданные,
+            оттуда берём <code>attribute.id</code> картинок, сами файлы
+            живут на основном CDN. Прокси-клиент мы не поставляем — поставь
+            его сам (например, Tor Browser или <code>tor</code> daemon).
+            После смены сетевых настроек — перезапусти приложение.
           </div>
         </div>
 
@@ -1193,7 +1205,7 @@ function renderNetworkTestResult() {
   return `<span class="net-test-result ${cls}">${escape(t.text || '')}</span>`;
 }
 
-const DEFAULT_ONION_GQL = 'http://reactorccdnf36aqvq34zbfzqyrcrpg3eyhilauovitrvmcjovsujmid.onion/graphql';
+const DEFAULT_ONION_BASE_URL = 'http://reactorccdnf36aqvq34zbfzqyrcrpg3eyhilauovitrvmcjovsujmid.onion';
 
 // ----- Input preservation across re-renders -----
 // All known input ids — only those present in the current DOM are captured/restored.
@@ -1404,10 +1416,15 @@ function wireEvents() {
     $('#' + id)?.addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
   };
   persistOnCommit('s-socks5-addr', 'socks5Addr');
-  persistOnCommit('s-gql-endpoint', 'graphqlEndpoint');
+  persistOnCommit('s-onion-base', 'onionBaseURL');
+
+  $('#s-recover-dmca')?.addEventListener('change', async e => {
+    state.appSettings.recoverDmcaViaOnion = e.target.checked;
+    await pushAppSettings();
+  });
 
   $('#btn-fill-onion')?.addEventListener('click', async () => {
-    state.appSettings.graphqlEndpoint = DEFAULT_ONION_GQL;
+    state.appSettings.onionBaseURL = DEFAULT_ONION_BASE_URL;
     state.networkTest = { state: 'idle' };
     await pushAppSettings();
     render({ skipCapture: true });
@@ -1421,7 +1438,7 @@ function wireEvents() {
       const r = await TestNetwork(
         !!state.appSettings.socks5Enabled,
         state.appSettings.socks5Addr || '',
-        state.appSettings.graphqlEndpoint || '',
+        state.appSettings.onionBaseURL || '',
       );
       if (r.ok) {
         state.networkTest = { state: 'ok', text: `OK · ${r.latencyMs} мс · ${r.address}` };
@@ -2602,7 +2619,8 @@ document.addEventListener('visibilitychange', () => {
       state.appSettings.hideRemovedPosts = app.hideRemovedPosts == null ? true : !!app.hideRemovedPosts;
       state.appSettings.socks5Enabled = !!app.socks5Enabled;
       state.appSettings.socks5Addr = app.socks5Addr || '';
-      state.appSettings.graphqlEndpoint = app.graphqlEndpoint || '';
+      state.appSettings.onionBaseURL = app.onionBaseURL || '';
+      state.appSettings.recoverDmcaViaOnion = !!app.recoverDmcaViaOnion;
     }
   } catch {}
   await refreshPresets();
