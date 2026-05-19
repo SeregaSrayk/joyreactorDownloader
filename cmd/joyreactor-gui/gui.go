@@ -740,7 +740,15 @@ func truncate(s string, n int) string {
 // produce paginates Query.search and emits jobs into the channel.
 // (Duplicated from internal/app, intentionally — keeping the GUI's own pipeline
 // so we can later layer per-page UI updates without changing the CLI pipeline.)
-func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *downloader.Downloader, jobs chan<- downloader.Job, pause *pauseGate, nameFormat string) error {
+//
+// settings is snapshotted at job-start time and controls whether DMCA-removed
+// posts are recovered via the onion mirror. Non-removed posts always go through
+// regular clearnet GraphQL; removed posts go through the mirror only when
+// RecoverDmcaViaOnion + Socks5Enabled + OnionBaseURL are all set. Failure to
+// recover (no SOCKS, mirror down, post not on mirror) falls through to the
+// existing "skip" behaviour, so a flaky mirror never blocks the rest of the
+// job.
+func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *downloader.Downloader, jobs chan<- downloader.Job, pause *pauseGate, nameFormat string, settings AppSettings) error {
 	seen := make(map[string]struct{})
 	sent := 0
 	// Page range honours Criteria.PageFrom / PageTo. PageFrom <=1 (or 0)
@@ -750,6 +758,9 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 	if startPage < 1 {
 		startPage = 1
 	}
+	recoveryActive := settings.RecoverDmcaViaOnion &&
+		settings.OnionBaseURL != "" &&
+		settings.Socks5Enabled
 	for page := startPage; ; page++ {
 		if c.PageTo > 0 && page > c.PageTo {
 			return nil
@@ -764,9 +775,28 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 		if res.PostPager == nil || len(res.PostPager.Posts) == 0 {
 			return nil
 		}
+		// Per-page onion recovery for DMCA-stubbed posts. Done before the main
+		// loop so we can splice recovered attributes back into the iteration
+		// transparently. Posts that fail to recover stay absent from the map
+		// and fall through to the regular "skip removed" branch.
+		var recoveredAttrs map[string][]graphql.Attribute
+		if recoveryActive {
+			var removed []graphql.Post
+			for _, p := range res.PostPager.Posts {
+				if p.IsRemoved() {
+					removed = append(removed, p)
+				}
+			}
+			recoveredAttrs = recoverAttrsViaOnion(ctx, removed, settings)
+		}
 		for _, p := range res.PostPager.Posts {
+			attrs := p.Attributes
 			if p.IsRemoved() {
-				continue
+				r, ok := recoveredAttrs[p.ID]
+				if !ok {
+					continue
+				}
+				attrs = r
 			}
 			if !c.MatchPostDate(p.CreatedAt) {
 				continue
@@ -774,7 +804,7 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 			if !c.MatchPostTags(tagNamesForMatching(p)) {
 				continue
 			}
-			for _, a := range p.Attributes {
+			for _, a := range attrs {
 				if a.Type != graphql.AttrPicture || a.Image == nil {
 					continue
 				}

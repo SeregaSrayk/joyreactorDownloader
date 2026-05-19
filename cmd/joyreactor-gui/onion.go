@@ -231,3 +231,66 @@ func (g *GUI) recoverViaOnion(previews []Preview, removedIdx []int, posts []grap
 	close(jobs)
 	wg.Wait()
 }
+
+// recoverAttrsViaOnion is the download-pipeline sibling of recoverViaOnion.
+// It scrapes the onion mirror for the given removed posts and returns a map
+// post.ID → synthetic graphql.Attribute slice for those that succeeded.
+// Posts that fail (transport error, no <img> in the HTML) are absent from
+// the map — produce() treats that as "still unrecoverable, skip".
+//
+// Same 4-worker / 90s cap as recoverViaOnion: bounded so a slow Tor circuit
+// can't stall a long-running download job between pages. Each search page
+// triggers its own bounded recovery — the budget is per-page, not per-job.
+func recoverAttrsViaOnion(ctx context.Context, removed []graphql.Post, s AppSettings) map[string][]graphql.Attribute {
+	if len(removed) == 0 {
+		return nil
+	}
+	transport, err := socksTransport(s)
+	if err != nil {
+		return nil
+	}
+	rctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
+	const workers = 4
+	type result struct {
+		postID string
+		attrs  []graphql.Attribute
+	}
+	in := make(chan graphql.Post)
+	out := make(chan result, len(removed))
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for p := range in {
+				_, postNum, decErr := graphql.DecodeID(p.ID)
+				if decErr != nil {
+					continue
+				}
+				recovered, err := recoverPostViaOnion(rctx, transport, s.OnionBaseURL, postNum)
+				if err != nil || len(recovered) == 0 {
+					continue
+				}
+				attrs := make([]graphql.Attribute, 0, len(recovered))
+				for _, r := range recovered {
+					attrs = append(attrs, r.Attr)
+				}
+				out <- result{postID: p.ID, attrs: attrs}
+			}
+		}()
+	}
+	for _, p := range removed {
+		in <- p
+	}
+	close(in)
+	wg.Wait()
+	close(out)
+
+	m := make(map[string][]graphql.Attribute, len(removed))
+	for r := range out {
+		m[r.postID] = r.attrs
+	}
+	return m
+}

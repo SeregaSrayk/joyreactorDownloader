@@ -220,7 +220,9 @@ func (m *jobManager) run(j *job) {
 		err = produceSelected(j.ctx, j.input.SelectedItems, dl, queue, j.pause, j.input.FilenameFormat)
 	} else {
 		c := m.g.mergeBlockedTags(criteriaFromDownload(j.input), j.input.UseBlockedTags)
-		err = produce(j.ctx, m.g.gql, c, dl, queue, j.pause, j.input.FilenameFormat)
+		// Snapshot settings at job-start time so a toggle mid-run can't change
+		// behaviour halfway through. Mirrors how dl/outDir are resolved above.
+		err = produce(j.ctx, m.g.gql, c, dl, queue, j.pause, j.input.FilenameFormat, loadAppSettings())
 	}
 	close(queue)
 	wg.Wait()
