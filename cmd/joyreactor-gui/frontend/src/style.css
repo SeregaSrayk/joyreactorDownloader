@@ -953,50 +953,49 @@ body.dragging-select * {
 .preset-row {
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 6px 10px;
   background: rgba(255, 255, 255, 0.02);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
 .preset-row:hover { background: rgba(255, 255, 255, 0.04); }
-.preset-head {
+.preset-row-main {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
 }
+.preset-name-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+}
 .preset-name {
   font-weight: 600;
   font-size: 14px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex-shrink: 0;
 }
-.preset-actions { display: flex; gap: 4px; }
-.preset-actions .icon-btn { padding: 4px 8px; font-size: 14px; }
 .preset-summary {
   font-size: 12px;
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
-.preset-folder {
-  font-size: 12px;
-  color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.preset-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.preset-actions .icon-btn { padding: 2px 6px; font-size: 13px; }
 .preset-schedule {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 14px;
+  gap: 12px;
   font-size: 12px;
-  margin-top: 2px;
 }
 .preset-autopull-toggle {
   display: inline-flex;

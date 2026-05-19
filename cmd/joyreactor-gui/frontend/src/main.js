@@ -871,12 +871,18 @@ function renderPresetsManagerModal() {
     </div>`;
 }
 
-// renderPresetRow — single row in the preset-manager modal.
-//   - data-name carries the preset name so the wired click handlers can
-//     find it without each button repeating the id.
-//   - data-next-due-sec on the .preset-next-due cell is the source of truth
-//     for the live countdown; tickPresetsCountdown decrements it in place.
-//   - Run/Load/Folder buttons gracefully disable when OutDir is empty,
+// renderPresetRow — single row in the preset-manager modal. Two compact
+// lines per preset (name + summary + actions on top, schedule on
+// bottom) so 8-10 rows fit on a typical viewport without scrolling.
+// Full folder path goes to the row's tooltip — the 📂 button is the
+// fast way to actually open it.
+//
+//   - data-name carries the preset name so the wired click handlers
+//     can find it without each button repeating the id.
+//   - data-next-due-sec on the .preset-next-due cell is the source of
+//     truth for the live countdown; tickPresetsCountdown decrements it
+//     in place every second.
+//   - Run/Folder buttons gracefully disable when OutDir is empty,
 //     mirroring the scheduler's "skip if no outDir" guard.
 function renderPresetRow(v) {
   const autoPullChecked = v.autoPull ? 'checked' : '';
@@ -893,13 +899,16 @@ function renderPresetRow(v) {
   const next = v.autoPull
     ? `<span class="preset-next-due" data-next-due-sec="${v.nextDueSec}" title="Расчёт от ⏱ + ${v.intervalH} ч (глобальный интервал)">→ ${formatNextDue(v.nextDueSec)}</span>`
     : `<span class="preset-next-due muted">→ автовыгрузка выключена</span>`;
-  const outdirShort = v.outDir
-    ? (v.outDir.length > 38 ? '…' + v.outDir.slice(-36) : v.outDir)
-    : '<span class="muted">папка не задана</span>';
+  const rowTitle = v.outDir
+    ? `Папка: ${v.outDir}`
+    : 'Папка не задана';
   return `
-    <div class="preset-row" data-name="${escape(v.name)}">
-      <div class="preset-head">
-        <div class="preset-name" title="${escape(v.name)}">${escape(v.name)}</div>
+    <div class="preset-row" data-name="${escape(v.name)}" title="${escape(rowTitle)}">
+      <div class="preset-row-main">
+        <div class="preset-name-summary">
+          <span class="preset-name">${escape(v.name)}</span>
+          <span class="preset-summary">· ${escape(v.summary)}</span>
+        </div>
         <div class="preset-actions">
           <button class="icon-btn" data-act="run"    title="${runTitle}" ${folderDisabled}>▶</button>
           <button class="icon-btn" data-act="folder" title="${folderTitle}" ${folderDisabled}>📂</button>
@@ -907,8 +916,6 @@ function renderPresetRow(v) {
           <button class="icon-btn danger" data-act="delete" title="Удалить пресет">🗑</button>
         </div>
       </div>
-      <div class="preset-summary">${escape(v.summary)}</div>
-      <div class="preset-folder" title="${escape(v.outDir)}">${v.outDir ? escape(outdirShort) : outdirShort}</div>
       <div class="preset-schedule">
         <label class="preset-autopull-toggle" title="Включить периодическую автовыгрузку этого пресета по глобальному интервалу">
           <input type="checkbox" data-act="autopull" ${autoPullChecked}>
@@ -2972,7 +2979,9 @@ EventsOn('job:update', j => {
   //     modal is the only surface that shows those counters live.
   //   - otherwise (queue closed, only progress tick) → DO NOTHING. The
   //     state.jobs[i] mutation above is enough; openQueue() does its
-  //     own render() and picks up whatever has accumulated.
+  //     own render() and picks up whatever has accumulated. This is the
+  //     fix for "почему загрузка триггерит вообще что-то" — most of
+  //     the time, nothing visible should change per saved picture.
   if (stateChanged) {
     render();
   } else if (state.queueOpen) {
