@@ -5,6 +5,7 @@ import {
   PreviewJobName,
   PickFolder, OpenOutputFolder,
   ListPresets, GetPreset, SavePreset, DeletePreset, SetPresetAutoPull,
+  ListPresetsDetailed, RunPresetNow,
   GetWindowSettings, SaveWindowSettings,
   GetAppSettings, SaveAppSettings,
   ManifestKeys, OpenManifestFolder, DeleteManifest, RebuildManifest,
@@ -70,7 +71,15 @@ const state = {
   selectedPosts: new Set(),  // postId strings the user manually picked for selective download
   manualSelect: lsBool(LS_MANUAL_SELECT, false),  // master toggle for the per-tile checkbox UI
   queueOpen: false,                                // job-queue modal visibility
+  presetsManagerOpen: false,                       // preset-manager modal visibility
+  presetViews: [],                                 // PresetView[] from ListPresetsDetailed, populated when modal opens
 };
+
+// Preset-manager countdown tick handle. setInterval id, or 0 when no tick
+// is running. Started in openPresetsManager, stopped in closePresetsManager.
+let _presetsTickTimer = 0;
+// Bookkeeping so the 60th tick can refresh the backend payload.
+let _presetsTickCount = 0;
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -167,6 +176,7 @@ function doRender() {
       </div>
       ${state.settingsOpen ? renderSettingsModal() : ''}
       ${state.queueOpen ? renderQueueModal() : ''}
+      ${state.presetsManagerOpen ? renderPresetsManagerModal() : ''}
       ${state.postModal ? renderPostPreview() : ''}
     </div>
   `;
@@ -240,6 +250,9 @@ function renderTopbar() {
     <div class="topbar">
       <div class="title">Joyreactor Downloader</div>
       <button class="icon-btn gear" id="btn-settings" title="Настройки скачивания">⚙</button>
+      <button class="topbar-btn" id="btn-presets-manager" title="Менеджер пресетов: расписания автовыгрузок, быстрый запуск, удаление">
+        📑 Пресеты
+      </button>
       <button class="topbar-btn" id="btn-queue" title="Очередь задач">
         📋 Очередь${queueBadge}
       </button>
@@ -804,6 +817,106 @@ function jobButtons(j) {
   return btn('open', '📂', 'Открыть папку') + btn('remove', '✕', 'Убрать из списка');
 }
 
+// renderPresetsManagerModal — the «🎛️ Пресеты» modal. One row per saved
+// preset showing summary + AutoPull + last/next countdown + actions. Live
+// countdown is updated in-place by tickPresetsCountdown (every 1s) reading
+// data-next-due-sec on each row, so we don't need to rebuild the DOM each
+// tick (saves flicker and a captureInputs round-trip).
+function renderPresetsManagerModal() {
+  const intervalH = state.appSettings?.autoPullIntervalHours || 24;
+  const rows = state.presetViews.length === 0
+    ? `<div class="presets-empty">Нет сохранённых пресетов. Заведи первый в форме фильтров: настрой фильтры и нажми «Сохранить как…».</div>`
+    : `<div class="presets-list">
+         ${state.presetViews.map(renderPresetRow).join('')}
+       </div>`;
+  return `
+    <div class="modal-backdrop" id="presets-backdrop">
+      <div class="modal wide presets-modal">
+        <div class="modal-header">
+          <h3>Пресеты <span class="muted" title="Глобальный интервал автовыгрузки — меняется в ⚙ → Авто-обновление">· интервал автовыгрузки: ${intervalH} ч</span></h3>
+          <div class="queue-modal-actions">
+            <button class="icon-btn" id="btn-presets-close" title="Закрыть (Esc)">✕</button>
+          </div>
+        </div>
+        ${rows}
+      </div>
+    </div>`;
+}
+
+// renderPresetRow — single row in the preset-manager modal.
+//   - data-name carries the preset name so the wired click handlers can
+//     find it without each button repeating the id.
+//   - data-next-due-sec on the .preset-next-due cell is the source of truth
+//     for the live countdown; tickPresetsCountdown decrements it in place.
+//   - Run/Load/Folder buttons gracefully disable when OutDir is empty,
+//     mirroring the scheduler's "skip if no outDir" guard.
+function renderPresetRow(v) {
+  const autoPullChecked = v.autoPull ? 'checked' : '';
+  const folderDisabled = v.hasOutDir ? '' : 'disabled';
+  const folderTitle = v.hasOutDir
+    ? `Открыть «${v.outDir}» в проводнике`
+    : 'У пресета не задана папка';
+  const runTitle = v.hasOutDir
+    ? 'Запустить пресет сейчас вручную (отметит как только что выгруженный — следующий авто-запуск через полный интервал)'
+    : 'Нельзя запустить — у пресета не задана папка';
+  const last = v.lastAutoPullAt
+    ? `<span class="preset-last" title="${escape(v.lastAutoPullAt)}">⏱ ${formatRelativePast(v.lastAutoPullAt)}</span>`
+    : `<span class="preset-last muted" title="Ещё не выгружался">⏱ ни разу</span>`;
+  const next = v.autoPull
+    ? `<span class="preset-next-due" data-next-due-sec="${v.nextDueSec}" title="Расчёт от ⏱ + ${v.intervalH} ч (глобальный интервал)">→ ${formatNextDue(v.nextDueSec)}</span>`
+    : `<span class="preset-next-due muted">→ автовыгрузка выключена</span>`;
+  const outdirShort = v.outDir
+    ? (v.outDir.length > 38 ? '…' + v.outDir.slice(-36) : v.outDir)
+    : '<span class="muted">папка не задана</span>';
+  return `
+    <div class="preset-row" data-name="${escape(v.name)}">
+      <div class="preset-head">
+        <div class="preset-name" title="${escape(v.name)}">${escape(v.name)}</div>
+        <div class="preset-actions">
+          <button class="icon-btn" data-act="run"    title="${runTitle}" ${folderDisabled}>▶</button>
+          <button class="icon-btn" data-act="folder" title="${folderTitle}" ${folderDisabled}>📂</button>
+          <button class="icon-btn" data-act="load"   title="Загрузить в форму для редактирования">📋</button>
+          <button class="icon-btn danger" data-act="delete" title="Удалить пресет">🗑</button>
+        </div>
+      </div>
+      <div class="preset-summary">${escape(v.summary)}</div>
+      <div class="preset-folder" title="${escape(v.outDir)}">${v.outDir ? escape(outdirShort) : outdirShort}</div>
+      <div class="preset-schedule">
+        <label class="preset-autopull-toggle" title="Включить периодическую автовыгрузку этого пресета по глобальному интервалу">
+          <input type="checkbox" data-act="autopull" ${autoPullChecked}>
+          Авто-обновление
+        </label>
+        ${last}
+        ${next}
+      </div>
+    </div>`;
+}
+
+// formatRelativePast — turns an ISO timestamp into a "Nмин назад" /
+// "Nч назад" / "Nдн назад" string. Best-effort: an unparseable input
+// just returns "—".
+function formatRelativePast(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '—';
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (sec < 10)        return 'только что';
+  if (sec < 60)        return `${sec}с назад`;
+  if (sec < 3600)      return `${Math.floor(sec / 60)} мин назад`;
+  if (sec < 86400)     return `${Math.floor(sec / 3600)} ч назад`;
+  return `${Math.floor(sec / 86400)} дн назад`;
+}
+
+// formatNextDue — "следующая через" in human form. ≤0 ⇒ "готова к запуску".
+function formatNextDue(sec) {
+  if (sec <= 0) return 'готова к запуску';
+  if (sec < 60)        return `через ${sec}с`;
+  if (sec < 3600)      return `через ${Math.floor(sec / 60)} мин`;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (m === 0) return `через ${h} ч`;
+  return `через ${h} ч ${m} мин`;
+}
+
 function jobStateLabel(s) {
   switch (s) {
     case 'running':  return '⏵ идёт';
@@ -1268,6 +1381,47 @@ function wireEvents() {
   $('#btn-queue-close')?.addEventListener('click', closeQueue);
   $('#queue-backdrop')?.addEventListener('click', e => {
     if (e.target.id === 'queue-backdrop') closeQueue();
+  });
+
+  $('#btn-presets-manager')?.addEventListener('click', openPresetsManager);
+  $('#btn-presets-close')?.addEventListener('click', closePresetsManager);
+  $('#presets-backdrop')?.addEventListener('click', e => {
+    if (e.target.id === 'presets-backdrop') closePresetsManager();
+  });
+  // Per-row delegated handler: every action button carries data-act and lives
+  // inside [data-name="<preset>"]. One listener covers run/folder/load/delete
+  // + the autopull toggle so we don't query-select N×4 buttons per render.
+  $('#presets-backdrop')?.addEventListener('click', async e => {
+    const row = e.target.closest('.preset-row');
+    if (!row) return;
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const name = row.getAttribute('data-name');
+    const act = btn.getAttribute('data-act');
+    if (!name || !act) return;
+    if (act === 'autopull') return; // handled by 'change' listener below
+    e.preventDefault();
+    await onPresetAction(name, act);
+  });
+  $('#presets-backdrop')?.addEventListener('change', async e => {
+    if (!e.target.matches('input[data-act="autopull"]')) return;
+    const row = e.target.closest('.preset-row');
+    const name = row?.getAttribute('data-name');
+    if (!name) return;
+    const on = e.target.checked;
+    const err = await SetPresetAutoPull(name, on);
+    if (err) {
+      showToast('error', `Не удалось переключить авто-обновление: ${err}`);
+      e.target.checked = !on;
+      return;
+    }
+    // Refresh local state.presetViews so next/last cells reflect the new
+    // autopull status (which controls whether the countdown is shown).
+    // Also keep the form's autopull checkbox in sync if this preset is the
+    // currently selected one.
+    if (state.currentPreset === name) state.currentPresetAutoPull = on;
+    await refreshPresetViews();
+    render();
   });
 
 
@@ -1848,6 +2002,75 @@ function closeQueue() {
   render();
 }
 
+// openPresetsManager — fetch the latest preset detail payload, open the
+// modal, and start the 1-second countdown tick. The tick decrements the
+// data-next-due-sec attribute on each row in place (cheap, no re-render),
+// and every 60 ticks (≈1 min) re-pulls the backend payload so a scheduler
+// run that fires while the modal is open is reflected without manual
+// reload.
+async function openPresetsManager() {
+  captureInputs();
+  await refreshPresetViews();
+  state.presetsManagerOpen = true;
+  render();
+  startPresetsTick();
+}
+
+function closePresetsManager() {
+  stopPresetsTick();
+  captureInputs();
+  state.presetsManagerOpen = false;
+  render();
+}
+
+async function refreshPresetViews() {
+  try {
+    state.presetViews = (await ListPresetsDetailed()) || [];
+  } catch {
+    state.presetViews = [];
+  }
+}
+
+function startPresetsTick() {
+  stopPresetsTick();
+  _presetsTickCount = 0;
+  _presetsTickTimer = setInterval(tickPresetsCountdown, 1000);
+}
+
+function stopPresetsTick() {
+  if (_presetsTickTimer) {
+    clearInterval(_presetsTickTimer);
+    _presetsTickTimer = 0;
+  }
+}
+
+// tickPresetsCountdown — runs every second while the preset modal is open.
+// For each .preset-next-due cell, read the source-of-truth attribute,
+// decrement, rewrite the human label. After 60 ticks (≈1 min) also re-fetch
+// the backend payload so the modal stays in sync with scheduler runs that
+// happened in the background (LastAutoPullAt would otherwise stay frozen
+// on whatever value was loaded when the modal opened).
+async function tickPresetsCountdown() {
+  if (!state.presetsManagerOpen) {
+    stopPresetsTick();
+    return;
+  }
+  _presetsTickCount++;
+  if (_presetsTickCount >= 60) {
+    _presetsTickCount = 0;
+    await refreshPresetViews();
+    render();
+    return;
+  }
+  for (const el of document.querySelectorAll('.preset-next-due[data-next-due-sec]')) {
+    const cur = parseInt(el.getAttribute('data-next-due-sec'), 10);
+    if (!Number.isFinite(cur)) continue;
+    const next = cur - 1;
+    el.setAttribute('data-next-due-sec', String(next));
+    el.textContent = '→ ' + formatNextDue(next);
+  }
+}
+
 async function openPostPreview(post) {
   captureInputs();
   state.postModal = { post, comments: null, loading: true, error: null };
@@ -2424,6 +2647,72 @@ async function doDeletePreset() {
   });
 }
 
+// onPresetAction — dispatcher for action buttons in the preset-manager
+// modal rows. Each branch does one thing and routes through the same
+// confirmation/toast UX as the inline preset controls would.
+async function onPresetAction(name, act) {
+  switch (act) {
+    case 'run': {
+      const err = await RunPresetNow(name);
+      if (err) {
+        showToast('error', `Не удалось запустить «${name}»: ${err}`);
+        return;
+      }
+      showToast('success', `Запущено: «${name}»`);
+      // The MarkAutoPullStarted side-effect just changed LastAutoPullAt;
+      // refresh views so the row's last/next cells reflect that.
+      await refreshPresetViews();
+      render();
+      return;
+    }
+    case 'folder': {
+      const v = state.presetViews.find(x => x.name === name);
+      if (!v || !v.outDir) return;
+      const err = await OpenOutputFolder(v.outDir);
+      if (err) showToast('error', err);
+      return;
+    }
+    case 'load': {
+      // Mirror selecting the preset in the form dropdown — load fields and
+      // close the modal so the user lands on the editable filters card.
+      //
+      // Order matters: stop the tick and flip the modal flag BEFORE
+      // applyPreset's render fires, but do NOT call closePresetsManager()
+      // (it would captureInputs() and read stale DOM values for the form
+      // fields behind the still-rendered modal, clobbering the f-outdir
+      // we just loaded). applyPreset's own render({skipCapture:true})
+      // will then rebuild the shell without the modal and push the
+      // freshly-loaded values into the DOM via restoreInputs.
+      stopPresetsTick();
+      state.presetsManagerOpen = false;
+      await applyPreset(name);
+      showToast('success', `Пресет «${name}» загружен в форму`);
+      return;
+    }
+    case 'delete': {
+      showConfirm(`Удалить пресет «${name}»?`, async () => {
+        const err = await DeletePreset(name);
+        if (err) {
+          showToast('error', err);
+          return;
+        }
+        // Cascade: if the deleted preset was the one selected in the form,
+        // clear that selection too so the form doesn't keep a dangling name.
+        if (state.currentPreset === name) {
+          state.currentPreset = '';
+          state.currentPresetAutoPull = false;
+          localStorage.removeItem(LS_LAST_PRESET);
+        }
+        await refreshPresets();
+        await refreshPresetViews();
+        render();
+        showToast('success', `Пресет «${name}» удалён`);
+      });
+      return;
+    }
+  }
+}
+
 // ----- Modal helpers -----
 function showPrompt(title, label, defaultValue, onSubmit) {
   const m = document.createElement('div');
@@ -2619,9 +2908,10 @@ EventsOn('auth:blocked-tags', n => {
 // ----- Boot -----
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
-  if (state.postModal)    { closePostPreview(); return; }
-  if (state.queueOpen)    { closeQueue();        return; }
-  if (state.settingsOpen) { closeSettings();     return; }
+  if (state.postModal)           { closePostPreview();     return; }
+  if (state.queueOpen)           { closeQueue();           return; }
+  if (state.presetsManagerOpen)  { closePresetsManager();  return; }
+  if (state.settingsOpen)        { closeSettings();        return; }
 });
 
 // When the user comes back from File Explorer (e.g. after deleting files

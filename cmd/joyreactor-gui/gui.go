@@ -764,6 +764,128 @@ func (g *GUI) SetPresetAutoPull(name string, on bool) string {
 	return ""
 }
 
+// PresetView is the per-row payload for the preset-manager modal. Fields
+// derived once on the Go side so the frontend doesn't have to duplicate
+// summary / countdown math; live countdown in the UI is just a setInterval
+// that decrements NextDueSec until refresh.
+type PresetView struct {
+	Name           string `json:"name"`
+	Summary        string `json:"summary"`        // one-line filter recap for the row
+	OutDir         string `json:"outDir"`         // preset's download folder, may be ""
+	HasOutDir      bool   `json:"hasOutDir"`      // false ⇒ auto-pull/run cannot proceed
+	AutoPull       bool   `json:"autoPull"`       // scheduler opt-in
+	LastAutoPullAt string `json:"lastAutoPullAt"` // RFC3339, "" if never auto-pulled
+	NextDueSec     int64  `json:"nextDueSec"`     // seconds until the next scheduler eligibility; ≤0 ⇒ due now; negative magnitude = how long overdue
+	IntervalH      int    `json:"intervalH"`      // active interval in hours (mirror of AppSettings, copied for convenience)
+}
+
+// ListPresetsDetailed returns the preset-manager modal's full payload —
+// every preset plus the derived summary + countdown to its next scheduled
+// fire. Sorted so AutoPull-enabled presets come first (the user's "live"
+// schedules), then alphabetically — that's the dropdown order users are
+// already used to for the rest.
+func (g *GUI) ListPresetsDetailed() []PresetView {
+	all := g.presets.All()
+	intervalH := loadAppSettings().AutoPullIntervalHours
+	if intervalH < 1 {
+		intervalH = 24
+	}
+	interval := time.Duration(intervalH) * time.Hour
+	now := time.Now()
+
+	views := make([]PresetView, 0, len(all))
+	for name, p := range all {
+		v := PresetView{
+			Name:      name,
+			Summary:   presetSummary(p),
+			OutDir:    p.OutDir,
+			HasOutDir: strings.TrimSpace(p.OutDir) != "",
+			AutoPull:  p.AutoPull,
+			IntervalH: intervalH,
+		}
+		if !p.LastAutoPullAt.IsZero() {
+			v.LastAutoPullAt = p.LastAutoPullAt.UTC().Format(time.RFC3339)
+			elapsed := now.Sub(p.LastAutoPullAt)
+			v.NextDueSec = int64((interval - elapsed) / time.Second)
+		} else {
+			// Never auto-pulled → due immediately if AutoPull is on.
+			v.NextDueSec = 0
+		}
+		views = append(views, v)
+	}
+	sort.Slice(views, func(i, j int) bool {
+		if views[i].AutoPull != views[j].AutoPull {
+			return views[i].AutoPull
+		}
+		return views[i].Name < views[j].Name
+	})
+	return views
+}
+
+// presetSummary builds a one-line filter recap for the preset-manager
+// modal row. Picks the most informative subset (tags or query, author,
+// rating range, only-favorite flag, limit) so the user can identify the
+// preset without expanding it.
+func presetSummary(p Preset) string {
+	var parts []string
+	switch {
+	case len(p.Tags) > 0:
+		tags := make([]string, 0, len(p.Tags))
+		for _, t := range p.Tags {
+			tags = append(tags, "#"+t)
+		}
+		parts = append(parts, strings.Join(tags, " "))
+	case strings.TrimSpace(p.Query) != "":
+		parts = append(parts, fmt.Sprintf("«%s»", p.Query))
+	}
+	if strings.TrimSpace(p.Username) != "" {
+		parts = append(parts, "@"+p.Username)
+	}
+	if p.MinRating != nil && p.MaxRating != nil {
+		parts = append(parts, fmt.Sprintf("★%d…%d", *p.MinRating, *p.MaxRating))
+	} else if p.MinRating != nil {
+		parts = append(parts, fmt.Sprintf("★%d+", *p.MinRating))
+	} else if p.MaxRating != nil {
+		parts = append(parts, fmt.Sprintf("★до %d", *p.MaxRating))
+	}
+	if p.OnlyFavorite {
+		parts = append(parts, "★избранное")
+	}
+	if p.OnlyNsfw {
+		parts = append(parts, "NSFW only")
+	}
+	if p.Limit > 0 {
+		parts = append(parts, fmt.Sprintf("≤%d шт", p.Limit))
+	}
+	if len(parts) == 0 {
+		return "без фильтров"
+	}
+	return strings.Join(parts, " · ")
+}
+
+// RunPresetNow enqueues a download job for the named preset using the
+// scheduler's exact code path (downloadInputFromPreset → jobs.add). Marks
+// LastAutoPullAt so the scheduler skips this preset for the next interval
+// — a manual run "consumes" the scheduled slot, matching the user's
+// expectation of "I just pulled this, don't run it again in 10 minutes".
+// Returns "" on success or the error message.
+func (g *GUI) RunPresetNow(name string) string {
+	p, ok := g.presets.Get(name)
+	if !ok {
+		return "пресет не найден"
+	}
+	in := downloadInputFromPreset(p)
+	if strings.TrimSpace(in.OutDir) == "" {
+		return "у пресета не задана папка — нечего сохранить"
+	}
+	jobName := name + " · вручную"
+	if _, err := g.jobs.add(in, jobName); err != nil {
+		return err.Error()
+	}
+	_ = g.presets.MarkAutoPullStarted(name, time.Now())
+	return ""
+}
+
 // ===== internals =====
 
 func fireToast(title, body, outDir string) {
