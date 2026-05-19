@@ -1125,14 +1125,88 @@ func buildFilenamePrim(postID, attrID, imageType string, tags []string, format s
 	attrNum := numOr(attrID)
 	ext := lower(imageType)
 	base := fmt.Sprintf("%s_%s.%s", postNum, attrNum, ext)
-	if format != "tags" {
+	switch format {
+	case "tags":
+		tagPart := joinTagsForName(tags, 6, 150)
+		if tagPart == "" {
+			return base
+		}
+		return fmt.Sprintf("%s_%s_%s.%s", tagPart, postNum, attrNum, ext)
+	case "joysave":
+		return buildJoySaveFilename(postNum, attrNum, tags, ext)
+	default:
 		return base
 	}
-	tagPart := joinTagsForName(tags, 6, 150)
-	if tagPart == "" {
-		return base
+}
+
+// buildJoySaveFilename emits a filename byte-for-byte compatible with corax4's
+// JoySave (joysave_main.pas:1131-1156), so a folder shared between the two
+// tools converges on the same on-disk names:
+//
+//	<postNum>_0_<attrNum padded to 9 zeros>__<tag1>-<tag2>-<tag3>-<tag4>.<ext>
+//
+// The '_0_' slot is JoySave's "post vs comment" marker — '0' for pictures
+// inside a post body, '1' for pictures attached to a comment. Our download
+// pipeline only consumes Post.Attributes from Query.search (no comment
+// pictures in scope), so '0' is hardcoded; switch to '1' if we ever surface
+// comment attachments in mass downloads.
+//
+// Tags follow JoySave's default mode (cbAllTagsToName unchecked): up to 4
+// first tags in their original order — NOT alphabetically sorted, intentionally,
+// so two downloads of the same post produce identical filenames only when the
+// API returns tags in the same order. JoySave accepts the same caveat. Spaces
+// inside a tag become '-'. The alternative "all tags joined with '=' " JoySave
+// mode is not exposed here.
+//
+// Finally Windows-reserved punctuation (\/:*?|<>") is replaced with '@' across
+// the whole assembled filename, matching JoySave's post-process sweep.
+func buildJoySaveFilename(postNum, attrNum string, tags []string, ext string) string {
+	padded := padLeftZeros(attrNum, 9)
+	var b strings.Builder
+	b.WriteString(postNum)
+	b.WriteString("_0_")
+	b.WriteString(padded)
+	b.WriteString("__")
+	for i, t := range tags {
+		if i >= 4 {
+			break
+		}
+		if i > 0 {
+			b.WriteByte('-')
+		}
+		b.WriteString(strings.ReplaceAll(t, " ", "-"))
 	}
-	return fmt.Sprintf("%s_%s_%s.%s", tagPart, postNum, attrNum, ext)
+	b.WriteByte('.')
+	b.WriteString(ext)
+	return sanitizeWindowsFilename(b.String())
+}
+
+// padLeftZeros pads s on the left with '0' until it reaches at least n bytes.
+// Returns s unchanged when it is already at least n bytes long. Used to
+// reproduce JoySave's `while length(ImgId) < 9 do ImgId := '0' + ImgId` loop.
+func padLeftZeros(s string, n int) string {
+	if len(s) >= n {
+		return s
+	}
+	return strings.Repeat("0", n-len(s)) + s
+}
+
+// sanitizeWindowsFilename replaces every char that Windows rejects in a path
+// component with '@', mirroring JoySave's joysave_main.pas:1148-1156 sweep.
+// Used by the joysave filename format so the produced name is identical to
+// what JoySave would write for the same post + picture.
+func sanitizeWindowsFilename(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\\', '/', ':', '*', '?', '|', '<', '>', '"':
+			b.WriteRune('@')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // produceSelected fans the user's hand-picked items into the download queue.

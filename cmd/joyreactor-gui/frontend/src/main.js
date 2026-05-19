@@ -686,8 +686,15 @@ function renderSettingsModal() {
                 <code class="muted">[art][cat][dog]_12345_67890.jpg</code>
               </span>
             </label>
+            <label>
+              <input type="radio" name="filename-fmt" value="joysave" ${state.filenameFormat === 'joysave' ? 'checked' : ''}>
+              <span>
+                <strong>JoySave-совместимый</strong>
+                <code class="muted">12345_0_000067890__art-cat-dog.jpeg</code>
+              </span>
+            </label>
           </div>
-          <div class="field-hint">Теги сортируются алфавитно (одинаковый пост → одинаковое имя), берётся до 6 шт. Спецсимволы (<code>/ \ : * ? " &lt; &gt; |</code>) заменяются на <code>-</code>, скобки внутри тега — на круглые. ID поста и атрибута добавляются хвостом, чтобы файлы не конфликтовали.</div>
+          <div class="field-hint">«По тегам»: теги в квадратных скобках, сортируются алфавитно (одинаковый пост → одинаковое имя), берётся до 6 шт., спецсимволы (<code>/ \ : * ? " &lt; &gt; |</code>) → <code>-</code>, скобки внутри тега → круглые. «JoySave-совместимый» 1:1 повторяет имена, которые пишет <a href="https://github.com/corax4/JoySave" target="_blank" rel="noopener">JoySave</a> (<code>&lt;postId&gt;_0_&lt;attrId padded to 9&gt;__&lt;до 4 тегов через -&gt;.ext</code>): пробелы в имени тега → <code>-</code>, спецсимволы → <code>@</code>, теги в исходном порядке без сортировки — удобно если папка делится между двумя инструментами.</div>
         </div>
 
         <div class="actions">
