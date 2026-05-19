@@ -875,6 +875,10 @@ func (g *GUI) RunPresetNow(name string) string {
 		return "пресет не найден"
 	}
 	in := downloadInputFromPreset(p)
+	// Apply the global filename-format preference — same reason as the
+	// scheduler: preset jobs spawn from Go without touching localStorage,
+	// so without this they'd silently fall back to the "id" default.
+	in.FilenameFormat = loadAppSettings().FilenameFormatOrDefault()
 	if strings.TrimSpace(in.OutDir) == "" {
 		return "у пресета не задана папка — нечего сохранить"
 	}

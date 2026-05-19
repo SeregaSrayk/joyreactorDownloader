@@ -1547,6 +1547,12 @@ function wireEvents() {
     r.addEventListener('change', e => {
       state.filenameFormat = e.target.value;
       localStorage.setItem(LS_FILENAME_FORMAT, e.target.value);
+      // Also persist to AppSettings so the Go scheduler / RunPresetNow
+      // see the same preference. Without this, auto-pulled and manually-
+      // launched preset jobs fall back to the "id" default — they spawn
+      // from Go and can't read localStorage.
+      state.appSettings.filenameFormat = e.target.value;
+      pushAppSettings();
     });
   });
 
@@ -3046,6 +3052,19 @@ document.addEventListener('visibilitychange', () => {
       state.appSettings.socks5Addr = app.socks5Addr || '';
       state.appSettings.onionBaseURL = app.onionBaseURL || '';
       state.appSettings.recoverDmcaViaOnion = !!app.recoverDmcaViaOnion;
+      // FilenameFormat lives in AppSettings now (so the Go scheduler
+      // can read it). If settings.json has a value, treat it as the
+      // source of truth and override the localStorage cache; otherwise
+      // push the localStorage value up to AppSettings so legacy users
+      // don't lose their preference on first launch after upgrade.
+      if (app.filenameFormat) {
+        state.filenameFormat = app.filenameFormat;
+        localStorage.setItem(LS_FILENAME_FORMAT, app.filenameFormat);
+        state.appSettings.filenameFormat = app.filenameFormat;
+      } else if (state.filenameFormat && state.filenameFormat !== 'id') {
+        state.appSettings.filenameFormat = state.filenameFormat;
+        SaveAppSettings({ ...state.appSettings }).catch(() => {});
+      }
     }
   } catch {}
   await refreshPresets();

@@ -73,7 +73,12 @@ func (g *GUI) runDueAutoPulls() {
 			continue
 		}
 		// Convert preset snapshot to a DownloadInput and enqueue.
+		// FilenameFormat is a global AppSettings preference (not stored
+		// per-preset), so we apply it here on every spawn — that way
+		// changing the format in the UI affects the next scheduled run
+		// for every preset, no per-preset config touch needed.
 		in := downloadInputFromPreset(p)
+		in.FilenameFormat = settings.FilenameFormatOrDefault()
 		if in.OutDir == "" {
 			// Preset has no outDir — can't auto-pull. Notify the user once
 			// per cycle and keep moving; flipping AutoPull off would be

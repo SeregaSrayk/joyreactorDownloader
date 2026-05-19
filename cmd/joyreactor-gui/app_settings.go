@@ -70,6 +70,29 @@ type AppSettings struct {
 	// Default false — opt-in because it costs an extra Tor round-trip per
 	// removed post in the search result.
 	RecoverDmcaViaOnion bool `json:"recoverDmcaViaOnion,omitempty"`
+
+	// FilenameFormat picks the on-disk naming scheme for saved pictures:
+	//   "id"      (default): "<postNum>_<attrNum>.<ext>"
+	//   "tags"             : "[tag1][tag2]..._<postNum>_<attrNum>.<ext>"
+	//   "joysave"          : JoySave-compatible
+	//                        "<postNum>_0_<attrNum padded to 9>__<tag>-<tag>.<ext>"
+	// Lives in AppSettings (not just localStorage) because the scheduler
+	// runs jobs from Go and needs to know the user's preference too —
+	// otherwise auto-pulled / ▶-launched preset jobs always fall back to
+	// "id" regardless of what's picked in the settings UI.
+	FilenameFormat string `json:"filenameFormat,omitempty"`
+}
+
+// FilenameFormatOrDefault returns the configured filename format,
+// falling back to "id" for empty/unset values. Centralises the default
+// so scheduler.go, RunPresetNow, and any future Go-side job spawners
+// stay in sync.
+func (s AppSettings) FilenameFormatOrDefault() string {
+	switch s.FilenameFormat {
+	case "id", "tags", "joysave":
+		return s.FilenameFormat
+	}
+	return "id"
 }
 
 // HideRemoved resolves the optional pointer to a concrete bool using the
@@ -147,6 +170,7 @@ func loadAppSettings() AppSettings {
 	s.Socks5Addr = loaded.Socks5Addr
 	s.OnionBaseURL = loaded.OnionBaseURL
 	s.RecoverDmcaViaOnion = loaded.RecoverDmcaViaOnion
+	s.FilenameFormat = loaded.FilenameFormat
 	// Legacy migration: earlier builds called this field GraphQLEndpoint and
 	// pre-filled it with "...onion/graphql". The new semantics is "base URL"
 	// (no path), so trim the obsolete suffix on first load. Cheap to do
