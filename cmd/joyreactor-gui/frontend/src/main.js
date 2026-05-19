@@ -7,7 +7,7 @@ import {
   ListPresets, GetPreset, SavePreset, DeletePreset, SetPresetAutoPull,
   GetWindowSettings, SaveWindowSettings,
   GetAppSettings, SaveAppSettings,
-  ManifestKeys, OpenManifestFolder, DeleteManifest,
+  ManifestKeys, OpenManifestFolder, DeleteManifest, RebuildManifest,
   TagSuggest, CheckUser, SuggestUsers, BlockedTagCount,
   PostComments,
   TestNetwork,
@@ -535,6 +535,9 @@ function renderSettingsModal() {
             </button>
             <button class="btn small danger" id="btn-delete-manifest" title="Удалить файл манифеста — все картинки снова будут считаться нескачанными">
               🗑️ Удалить манифест
+            </button>
+            <button class="btn small danger" id="btn-rebuild-manifest" title="Просканировать указанную папку с подпапками и сделать так, чтобы манифест содержал ровно те attribute id, что есть на диске. Записи о файлах, которых нет в этой папке, будут удалены.">
+              🔄 Полностью пересобрать по файлам из директории…
             </button>
           </div>
         </div>
@@ -1464,6 +1467,37 @@ function wireEvents() {
     const outDir = state.formInputs['f-outdir'] || '';
     const err = await OpenManifestFolder(outDir);
     if (err) showToast('error', err);
+  });
+
+  $('#btn-rebuild-manifest')?.addEventListener('click', async () => {
+    const dir = await PickFolder();
+    if (!dir) return;
+    const warning = state.appSettings.manifestMode === 'global'
+      ? `Полностью пересобрать общий манифест по содержимому «${dir}»? Записи о файлах из других папок будут удалены — в режиме «общий» это особенно опасно.`
+      : `Полностью пересобрать манифест по содержимому «${dir}»? Записи о файлах, которых нет в этой папке, будут удалены.`;
+    showConfirm(warning, async () => {
+      const btn = $('#btn-rebuild-manifest');
+      const original = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '⏳ Сканирую…';
+      try {
+        const res = await RebuildManifest(dir);
+        if (res?.error) {
+          showToast('error', res.error);
+          return;
+        }
+        const added = res?.added ?? 0;
+        const removed = res?.removed ?? 0;
+        const scanned = res?.scanned ?? 0;
+        const inspected = res?.inspected ?? 0;
+        showToast('success', `Обошёл ${inspected} файлов, подошло ${scanned}, добавлено ${added}, удалено ${removed}`);
+        await refreshDownloadedKeys();
+        render({ skipCapture: true });
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = original;
+      }
+    });
   });
 
   $('#btn-delete-manifest')?.addEventListener('click', () => {

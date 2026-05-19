@@ -601,6 +601,56 @@ func (g *GUI) DeleteManifest(outDir string) string {
 	return ""
 }
 
+// RebuildResult — outcome of RebuildManifest. Added is how many new
+// keys landed in the manifest, Removed is how many stale entries were
+// dropped because their files no longer exist on disk, Scanned is the
+// number of files whose names matched one of the supported formats,
+// Inspected is the total number of files the walk visited (Scanned +
+// names that didn't match — useful for sanity-checking that recursion
+// reached deep folders). Error is "" on success.
+type RebuildResult struct {
+	Added     int    `json:"added"`
+	Removed   int    `json:"removed"`
+	Scanned   int    `json:"scanned"`
+	Inspected int    `json:"inspected"`
+	Error     string `json:"error"`
+}
+
+// RebuildManifest walks scanDir recursively, parses filenames in any
+// format recognised by downloader.parseAttrID (id / tags / joysave /
+// seo), and rewrites the active manifest so it contains exactly the
+// attribute IDs found on disk. Stale entries — including, in "global"
+// ManifestMode, entries that belong to other folders not being scanned
+// — are deleted. The caller is expected to confirm the destructiveness
+// in the UI.
+func (g *GUI) RebuildManifest(scanDir string) RebuildResult {
+	if scanDir == "" {
+		return RebuildResult{Error: "укажи папку для сканирования"}
+	}
+	info, err := os.Stat(scanDir)
+	if err != nil {
+		return RebuildResult{Error: err.Error()}
+	}
+	if !info.IsDir() {
+		return RebuildResult{Error: "путь не является папкой: " + scanDir}
+	}
+	m, err := downloader.LoadManifestFile(manifestPathFor(scanDir))
+	if err != nil {
+		return RebuildResult{Error: err.Error()}
+	}
+	stats, err := m.RebuildFromDir(scanDir)
+	res := RebuildResult{
+		Added:     stats.Added,
+		Removed:   stats.Removed,
+		Scanned:   stats.Scanned,
+		Inspected: stats.Inspected,
+	}
+	if err != nil {
+		res.Error = err.Error()
+	}
+	return res
+}
+
 // activeManifestFolder resolves the parent directory of the active
 // manifest. Mirrors manifestPathFor's logic.
 func activeManifestFolder(outDir string) (string, error) {
