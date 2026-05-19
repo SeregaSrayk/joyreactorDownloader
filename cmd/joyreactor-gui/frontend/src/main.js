@@ -114,6 +114,29 @@ function render(opts = {}) {
   });
 }
 
+// bgRender — debounced variant for background-driven renders (the
+// job:update flood during mass downloads, ~60 events/sec). The rAF-
+// coalesced render() still fires up to 60 times/sec, and each fire
+// rebuilds #app.innerHTML wholesale — which is visible as flicker on
+// hovers, chip rows, and the tag autocomplete root, even though almost
+// nothing in the shell actually depends on per-Fetch progress.
+//
+// Debouncing to 250ms collapses bursts to ≤4 renders/sec — still feels
+// "live" inside the queue modal (the only place per-pic counters are
+// shown), and inside-folder green check-marks have their own 1Hz
+// throttle so they're unaffected. Final state transitions still arrive
+// promptly because Go emits job:update on done/canceled/error too —
+// the 250ms debounce just spaces them out instead of dropping any.
+let _bgRenderTimer = 0;
+function bgRender(opts = {}) {
+  if (opts.skipCapture) _pendingOpts.skipCapture = true;
+  if (_bgRenderTimer) return;
+  _bgRenderTimer = setTimeout(() => {
+    _bgRenderTimer = 0;
+    render();
+  }, 250);
+}
+
 // shouldDeferRender returns true only while an autocomplete dropdown is
 // actually visible — wiping #app innerHTML mid-selection would destroy
 // the dropdown before the user can click an item. We do NOT defer just
@@ -408,6 +431,11 @@ function renderFiltersCard() {
 // what the user will actually see, so flag the label explicitly.
 function renderFoundCount() {
   if (state.count === null) return '';
+  // JR's GraphQL Query.search caps PostPager.Count at 1000 for wide
+  // searches — the field tops out at exactly 1000 even when the true
+  // total is larger. Empirically verified, no schema docs say so.
+  // Show "+" when we hit that ceiling to make it clear the number is
+  // a floor, not the exact total.
   const totalStr = `${state.count}${state.count >= 1000 ? '+' : ''}`;
   if (state.kinds.length > 0) {
     return `<span class="muted" title="JoyReactor не умеет фильтровать по типу медиа на сервере — это общее число постов в поиске. Тип отбирается уже в приложении, см. «Превью» ниже.">
@@ -2597,7 +2625,47 @@ function maybeRefreshDownloadedKeys() {
   const now = Date.now();
   if (now - _lastManifestRefresh < 1000) return;
   _lastManifestRefresh = now;
-  refreshDownloadedKeys().then(() => render({ skipCapture: true }));
+  refreshDownloadedKeys().then(() => updateTileDownloadedBadges());
+}
+
+// updateTileDownloadedBadges — surgical refresh of just the .tile-have
+// green-check badges on existing tiles. Called from the 1Hz manifest
+// poll during active downloads. Avoids the full #app innerHTML rebuild
+// that render() would do, which is what was causing visible judder on
+// inputs / hovers / autocomplete / scroll while pictures were landing
+// in the active folder.
+function updateTileDownloadedBadges() {
+  const grid = document.querySelector('.results-grid');
+  if (!grid) return;
+  for (const tile of grid.querySelectorAll('.tile[data-post-id]')) {
+    const id = tile.getAttribute('data-post-id');
+    const p = state.results.find(x => x.postId === id);
+    if (!p) continue;
+    const want = tileDownloadState(p); // '' | 'partial' | 'full'
+    const leftCorner = tile.querySelector('.tile-corner.left');
+    if (!leftCorner) continue;
+    let have = leftCorner.querySelector('.tile-badge.tile-have');
+    if (want === '') {
+      if (have) have.remove();
+      continue;
+    }
+    const wantClass = want === 'full'
+      ? 'tile-badge tile-have'
+      : 'tile-badge tile-have partial';
+    const wantTitle = want === 'full'
+      ? 'все картинки поста уже скачаны в текущую папку'
+      : 'часть картинок поста уже скачаны';
+    if (have) {
+      if (have.className !== wantClass) have.className = wantClass;
+      if (have.title     !== wantTitle) have.title     = wantTitle;
+    } else {
+      have = document.createElement('div');
+      have.className   = wantClass;
+      have.title       = wantTitle;
+      have.textContent = '✓';
+      leftCorner.prepend(have);
+    }
+  }
 }
 
 // syncOutdirToPreset persists the current outdir field back into the selected
@@ -2878,21 +2946,38 @@ function attachUserValidation(input, hint) {
 
 // ----- Events -----
 EventsOn('job:update', j => {
+  const prev = state.jobs.find(x => x.id === j.id);
+  const stateChanged = !prev || prev.state !== j.state;
   const i = state.jobs.findIndex(x => x.id === j.id);
   if (i >= 0) state.jobs[i] = j;
   else state.jobs.push(j);
-  // If this job is writing into the folder we're currently previewing,
-  // refresh the manifest so new tiles light up green as files land.
+  // Picture just landed in the folder the user is previewing → refresh
+  // the manifest so tile checks turn green. Surgical: only the .tile-have
+  // badges in the existing grid get patched — no full shell rebuild.
   const cur = state.formInputs['f-outdir'] || '';
   if (cur && j.outDir === cur) {
     if (isFinished(j.state)) {
       _lastManifestRefresh = 0;            // force, ignore throttle
-      refreshDownloadedKeys().then(() => render({ skipCapture: true }));
+      refreshDownloadedKeys().then(() => updateTileDownloadedBadges());
     } else {
       maybeRefreshDownloadedKeys();
     }
   }
-  render();
+  // Decide whether the visible UI needs a re-render.
+  //   - stateChanged (running → done/canceled/error, add, remove) flips
+  //     the topbar queue badge and any queue-table row state — render
+  //     immediately for snappy feedback.
+  //   - queueOpen + only counter tick (saved/skipped/failed bumped while
+  //     state stays 'running') → bgRender (250ms debounce). The queue
+  //     modal is the only surface that shows those counters live.
+  //   - otherwise (queue closed, only progress tick) → DO NOTHING. The
+  //     state.jobs[i] mutation above is enough; openQueue() does its
+  //     own render() and picks up whatever has accumulated.
+  if (stateChanged) {
+    render();
+  } else if (state.queueOpen) {
+    bgRender();
+  }
 });
 
 EventsOn('job:removed', id => {
