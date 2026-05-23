@@ -400,17 +400,19 @@ input[type="checkbox"] {
 
 .segmented {
   display: inline-flex;
+  flex-wrap: wrap;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 2px;
-  overflow: hidden;
+  gap: 2px;
 }
 .segmented button {
-  padding: 6px 14px;
-  font-size: 13px;
+  padding: 6px 9px;
+  font-size: 12.5px;
   border-radius: 4px;
   color: var(--muted);
+  white-space: nowrap;
 }
 .segmented button.active {
   background: var(--accent);
@@ -677,6 +679,11 @@ body.dragging-select * {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+  /* Fixed layout means cell widths follow the .col-* rules instead of
+     auto-expanding to fit content — without it a very long error string
+     (e.g. "GET https://…: HTTP 403") stretches .col-name past the table
+     edge and the text-overflow:ellipsis on .job-error-inline never fires. */
+  table-layout: fixed;
 }
 .queue-table thead th {
   position: sticky;
@@ -990,6 +997,19 @@ body.dragging-select * {
 }
 .preset-actions { display: flex; gap: 2px; flex-shrink: 0; }
 .preset-actions .icon-btn { padding: 2px 6px; font-size: 13px; }
+.preset-outdir-row {
+  font-size: 12px;
+  color: var(--muted);
+}
+.preset-outdir {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: bottom;
+}
 .preset-schedule {
   display: flex;
   align-items: center;

@@ -21,6 +21,10 @@ type Preset struct {
 	MinRating    *int     `json:"minRating,omitempty"`
 	MaxRating    *int     `json:"maxRating,omitempty"`
 	Sort         string   `json:"sort"`
+	// Feed switches the preset's job from Query.search to Tag.postPager
+	// (line types "all"/"best"/"good"/"new"). Empty = search. When set,
+	// exactly one tag must be in Tags — the entry isn't usable otherwise.
+	Feed         string   `json:"feed,omitempty"`
 	ShowNsfw     bool     `json:"showNsfw"`
 	OnlyNsfw     bool     `json:"onlyNsfw"`
 	ShowUnsafe   bool     `json:"showUnsafe"`

@@ -71,6 +71,39 @@ type AppSettings struct {
 	// removed post in the search result.
 	RecoverDmcaViaOnion bool `json:"recoverDmcaViaOnion,omitempty"`
 
+	// FolderSplitEvery, when > 0, makes the downloader save into rotating
+	// subfolders outDir/part-001, part-002, … and switch to a fresh one
+	// after every N units. 0 (default) keeps the historical "everything
+	// in one folder" behaviour. Useful when a tag pulls thousands of
+	// files and Explorer/Finder starts lagging on the flat listing.
+	//
+	// What "N units" means is decided by FolderSplitUnit below.
+	FolderSplitEvery int `json:"folderSplitEvery,omitempty"`
+
+	// FolderSplitUnit chooses what FolderSplitEvery counts:
+	//   "posts" (default when split is on): keeps every picture of a
+	//           single post (multi-image comics / photosets) in the
+	//           same part-XXX. Boundaries fall between posts.
+	//   "pages": one part-XXX per N pages of the GraphQL feed. Posts
+	//           never split, plus easy to map back to "page N of the
+	//           original feed".
+	//   "files": legacy raw-file counter. Faster to reason about file
+	//           counts, but a multi-image post may span two part-XXX
+	//           if it crosses the boundary mid-fetch.
+	// Empty string falls back to "posts" when FolderSplitEvery > 0.
+	FolderSplitUnit string `json:"folderSplitUnit,omitempty"`
+
+	// CdnMinIntervalMs caps how often the binary-fetch client (CDN)
+	// issues a request: between two successive Get calls, at least this
+	// many milliseconds must elapse. Zero (default) keeps the historical
+	// "as fast as workers can pull" behaviour. Useful when the CDN-WAF
+	// starts handing out HTTP 403 bursts and the user wants proactive
+	// pacing on top of (or instead of) lowering worker count.
+	//
+	// 200–400ms is a reasonable starting point per the JR scraper folklore;
+	// the GUI exposes a free-form number field so the user can tune.
+	CdnMinIntervalMs int `json:"cdnMinIntervalMs,omitempty"`
+
 	// FilenameFormat picks the on-disk naming scheme for saved pictures:
 	//   "id"      (default): "<postNum>_<attrNum>.<ext>"
 	//   "tags"             : "[tag1][tag2]..._<postNum>_<attrNum>.<ext>"
@@ -81,6 +114,18 @@ type AppSettings struct {
 	// otherwise auto-pulled / ▶-launched preset jobs always fall back to
 	// "id" regardless of what's picked in the settings UI.
 	FilenameFormat string `json:"filenameFormat,omitempty"`
+}
+
+// FolderSplitUnitOrDefault returns the configured unit, falling back to
+// "posts" when split is enabled but the unit field is empty. Mirrors
+// FilenameFormatOrDefault for safety: any caller that already checks
+// FolderSplitEvery > 0 doesn't have to also remember to validate the unit.
+func (s AppSettings) FolderSplitUnitOrDefault() string {
+	switch s.FolderSplitUnit {
+	case "posts", "pages", "files":
+		return s.FolderSplitUnit
+	}
+	return "posts"
 }
 
 // FilenameFormatOrDefault returns the configured filename format,
@@ -171,6 +216,16 @@ func loadAppSettings() AppSettings {
 	s.OnionBaseURL = loaded.OnionBaseURL
 	s.RecoverDmcaViaOnion = loaded.RecoverDmcaViaOnion
 	s.FilenameFormat = loaded.FilenameFormat
+	if loaded.FolderSplitEvery > 0 {
+		s.FolderSplitEvery = loaded.FolderSplitEvery
+	}
+	switch loaded.FolderSplitUnit {
+	case "posts", "pages", "files":
+		s.FolderSplitUnit = loaded.FolderSplitUnit
+	}
+	if loaded.CdnMinIntervalMs > 0 {
+		s.CdnMinIntervalMs = loaded.CdnMinIntervalMs
+	}
 	// Legacy migration: earlier builds called this field GraphQLEndpoint and
 	// pre-filled it with "...onion/graphql". The new semantics is "base URL"
 	// (no path), so trim the obsolete suffix on first load. Cheap to do

@@ -19,6 +19,28 @@ const (
 	SortDate    SortMode = "date"
 )
 
+// FeedMode picks the GraphQL entry point. Empty (default) uses Query.search
+// — the full filterable API. Non-empty values switch to Tag.postPager with
+// the matching PostLineType so the user can mirror the joyreactor.cc feeds:
+//
+//	"all"  → Бездна (всё подряд)
+//	"best" → Лучшее
+//	"good" → Хорошее
+//	"new"  → Новое
+//
+// Tag.postPager only takes a tag name + line type — server-side filters
+// (rating, NSFW, author, exclude, sort) are not available there. Anything
+// the user typed in those fields is applied client-side, post-fetch.
+type FeedMode string
+
+const (
+	FeedSearch FeedMode = ""
+	FeedAll    FeedMode = "all"
+	FeedBest   FeedMode = "best"
+	FeedGood   FeedMode = "good"
+	FeedNew    FeedMode = "new"
+)
+
 // Criteria describes what the user wants to download.
 //
 // Fields are split into three groups:
@@ -34,6 +56,12 @@ type Criteria struct {
 	MinRating    *int
 	MaxRating    *int
 	Sort         SortMode
+	// Feed switches the pipeline to Tag.postPager (one of ALL/BEST/GOOD/NEW
+	// line types). When non-empty, GraphQL search params above are unused
+	// — server-side filters don't exist on the tag pager — and the client
+	// matchers (MatchPostTags / MatchImage / MatchPostDate) plus an extra
+	// in-code rating/NSFW pass are the only filters applied.
+	Feed         FeedMode
 	ShowNsfw     bool
 	OnlyNsfw     bool
 	ShowUnsafe   bool
@@ -88,6 +116,36 @@ func (c Criteria) MatchPostDate(createdAt time.Time) bool {
 		return false
 	}
 	if !c.DateTo.IsZero() && createdAt.After(c.DateTo) {
+		return false
+	}
+	return true
+}
+
+// MatchPostRating reports whether rating falls in [MinRating, MaxRating].
+// Used in feed mode (Tag.postPager) where there's no server-side rating
+// argument — search mode lets the server pre-filter so this is unused there.
+func (c Criteria) MatchPostRating(rating float64) bool {
+	if c.MinRating != nil && rating < float64(*c.MinRating) {
+		return false
+	}
+	if c.MaxRating != nil && rating > float64(*c.MaxRating) {
+		return false
+	}
+	return true
+}
+
+// MatchPostNsfw applies the GUI's NSFW/unsafe toggles client-side. Used
+// in feed mode where Tag.postPager doesn't take those flags. Mirrors the
+// server's effective semantics: ShowNsfw off ⇒ drop nsfw posts; OnlyNsfw
+// on ⇒ drop non-nsfw posts; ShowUnsafe off ⇒ drop unsafe posts.
+func (c Criteria) MatchPostNsfw(nsfw, unsafe bool) bool {
+	if nsfw && !c.ShowNsfw {
+		return false
+	}
+	if c.OnlyNsfw && !nsfw {
+		return false
+	}
+	if unsafe && !c.ShowUnsafe {
 		return false
 	}
 	return true

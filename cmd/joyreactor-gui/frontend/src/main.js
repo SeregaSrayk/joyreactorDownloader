@@ -63,7 +63,7 @@ const state = {
   blockedCount: 0,
   postModal: null,   // { post, comments, loading, error } when the right-click preview is open
   windowSettings: { width: 1180, height: 820, maximized: false },
-  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false, hideRemovedPosts: true, socks5Enabled: false, socks5Addr: '', onionBaseURL: '', recoverDmcaViaOnion: false },
+  appSettings: { manifestMode: 'per-folder', autoPullIntervalHours: 24, autostart: false, startMinimized: false, minimizeToTrayOnClose: false, hideRemovedPosts: true, socks5Enabled: false, socks5Addr: '', onionBaseURL: '', recoverDmcaViaOnion: false, folderSplitEvery: 0, folderSplitUnit: 'posts', cdnMinIntervalMs: 0 },
   // Last network-test result, shown next to the "Проверить" button until the
   // user changes any field. {state:'idle'|'testing'|'ok'|'error', text:'...'}.
   networkTest: { state: 'idle' },
@@ -385,11 +385,15 @@ function renderFiltersCard() {
           </div>
         </div>` : ''}
       <div class="field">
-        <label>Сортировка${state.showPageRange ? ' · диапазон страниц' : ''}</label>
+        <label>Сортировка / лента${state.showPageRange ? ' · диапазон страниц' : ''}</label>
         <div class="sort-row">
-          <div class="segmented" id="seg-sort">
-            <button data-v="rating" class="${state.sort === 'rating' ? 'active' : ''}">рейтинг</button>
-            <button data-v="date"   class="${state.sort === 'date'   ? 'active' : ''}">дата</button>
+          <div class="segmented" id="seg-sort" title="«рейтинг» и «дата» — поиск с фильтрами. «бездна / лучшее / хорошее / новое» — ленты тега (требуется ровно один тег, серверные фильтры рейтинга/NSFW игнорируются и применяются локально).">
+            <button data-v="rating" class="${state.sort === 'rating' ? 'active' : ''}" title="search · sortByRating">рейтинг</button>
+            <button data-v="date"   class="${state.sort === 'date'   ? 'active' : ''}" title="search · sortByDate">дата</button>
+            <button data-v="all"    class="${state.sort === 'all'    ? 'active' : ''}" title="Tag.postPager(ALL) — Бездна">бездна</button>
+            <button data-v="best"   class="${state.sort === 'best'   ? 'active' : ''}" title="Tag.postPager(BEST) — Лучшее">лучшее</button>
+            <button data-v="good"   class="${state.sort === 'good'   ? 'active' : ''}" title="Tag.postPager(GOOD) — Хорошее">хорошее</button>
+            <button data-v="new"    class="${state.sort === 'new'    ? 'active' : ''}" title="Tag.postPager(NEW) — Новое">новое</button>
           </div>
           ${state.showPageRange ? `
             <div class="page-range" title="JR отдаёт ~10 постов на страницу. Пусто/0 = без ограничения с этой стороны.">
@@ -399,6 +403,7 @@ function renderFiltersCard() {
               <span class="muted">стр.</span>
             </div>` : ''}
         </div>
+        ${isFeedMode(state.sort) ? renderFeedHint() : ''}
       </div>
       <div class="field">
         <label>Флаги</label>
@@ -423,6 +428,18 @@ function renderFiltersCard() {
         ${renderFoundCount()}
       </div>
     </div>`;
+}
+
+// renderFeedHint warns when the user picked a Tag.postPager line type
+// without exactly one tag — the entry point can't run without that. Keep
+// the message inline next to the selector so it's discoverable without
+// clicking «Найти» and reading a queue error.
+function renderFeedHint() {
+  const n = state.tags.length;
+  if (n === 1) {
+    return `<div class="field-hint">Лента тега <code>#${escape(state.tags[0])}</code>. Серверные фильтры (рейтинг, NSFW) отключены — JR-лента их не принимает, применяю локально.</div>`;
+  }
+  return `<div class="field-hint" style="color: var(--warn, #d97706)">⚠️ Режим «лента тега» работает только с одним тегом. Сейчас выбрано: ${n}.</div>`;
 }
 
 // renderFoundCount — JR's `Query.search` doesn't accept a media-type
@@ -584,6 +601,45 @@ function renderSettingsModal() {
         </div>
 
         <div class="settings-section">
+          <h4>Структура папки</h4>
+          <div class="row">
+            <div class="field">
+              <label>Разбивать на подпапки <code>part-001</code>, <code>part-002</code>… по N (0 — не разбивать)</label>
+              <input type="number" id="s-folder-split" min="0" max="100000" step="10"
+                     value="${state.appSettings.folderSplitEvery || 0}">
+            </div>
+            <div class="field">
+              <label>Считать в чём</label>
+              <select id="s-folder-split-unit">
+                <option value="posts" ${(state.appSettings.folderSplitUnit || 'posts') === 'posts' ? 'selected' : ''}>постах</option>
+                <option value="pages" ${state.appSettings.folderSplitUnit === 'pages' ? 'selected' : ''}>страницах</option>
+                <option value="files" ${state.appSettings.folderSplitUnit === 'files' ? 'selected' : ''}>файлах</option>
+              </select>
+            </div>
+          </div>
+          <div class="field-hint">
+            Когда в задаче набегают тысячи файлов, проводник начинает
+            тормозить на плоском списке. С разбивкой каждые N единиц
+            открывается новая подпапка <code>part-XXX</code>.
+            <ul style="margin: 4px 0 0 18px; padding: 0;">
+              <li><b>постах</b> (по умолчанию) — посты не рвутся, фотосет/комикс
+                всегда целиком в одной подпапке.</li>
+              <li><b>страницах</b> — одна <code>part-XXX</code> на N страниц
+                ленты, удобно мапить «страница такая-то» → папка.</li>
+              <li><b>файлах</b> — точный счётчик по картинкам, но многокартиночный
+                пост может разорваться между двумя <code>part-XXX</code>.</li>
+            </ul>
+            Изменение применяется к новым задачам. Если в папке уже есть
+            <code>part-XXX</code> от прошлого запуска, дозаливаем
+            последнюю.
+            <br>⚠️ При включённой разбивке файл считается уже скачанным
+            только если он есть в манифесте. Если у тебя на диске лежат
+            старые файлы без манифеста — сначала запусти «Полностью
+            пересобрать манифест» в секции выше.
+          </div>
+        </div>
+
+        <div class="settings-section">
           <h4>Сеть</h4>
           <div class="toggles">
             <label>
@@ -635,7 +691,21 @@ function renderSettingsModal() {
             оттуда берём <code>attribute.id</code> картинок, сами файлы
             живут на основном CDN. Прокси-клиент мы не поставляем — поставь
             его сам (например, Tor Browser или <code>tor</code> daemon).
-            После смены сетевых настроек — перезапусти приложение.
+            Сетевые настройки применяются на лету — перезапуск приложения
+            не нужен, сессия логина не теряется.
+          </div>
+          <div class="field">
+            <label>Мин. пауза между запросами CDN, мс (0 — без ограничения)</label>
+            <input type="number" id="s-cdn-min-interval" min="0" max="10000" step="50"
+                   value="${state.appSettings.cdnMinIntervalMs || 0}">
+            <div class="field-hint">
+              JR-CDN иногда выдаёт серии HTTP 403, если ему льют слишком
+              густо. Этот лимит ограничивает частоту запросов картинок
+              сверху: следующий запрос пойдёт не раньше, чем через N мс
+              после предыдущего. Действует поверх «потоков»: например,
+              4 потока × 300мс ≈ 13 файлов/сек, а не 4 одновременно.
+              Эмпирически 200–400мс защищает от 403-баррикад.
+            </div>
           </div>
         </div>
 
@@ -809,6 +879,7 @@ function renderJobRow(j, i) {
       <td class="col-name" title="${escape(j.name)}">
         <div class="job-name-cell">${escape(j.name)}</div>
         ${j.error ? `<div class="job-error-inline" title="${escape(j.error)}">${escape(j.error)}</div>` : ''}
+        ${j.lastErr && !j.error ? `<div class="job-error-inline" title="Последняя ошибка скачивания (всего: ${j.failed}). Полный текст в tooltip.\n\n${escape(j.lastErr)}">${escape(j.lastErr)}</div>` : ''}
       </td>
       <td class="col-folder" title="${escape(folder)}">${escape(folderShort)}</td>
       <td class="col-progress">
@@ -831,7 +902,12 @@ function renderJobStats(j, determinate) {
   const parts = [];
   if (j.saved   > 0) parts.push(`<span class="stat saved"   title="скачано: ${j.saved}">${j.saved}<span class="stat-icon">✓</span></span>`);
   if (j.skipped > 0) parts.push(`<span class="stat skipped" title="пропущено (есть в манифесте): ${j.skipped}">${j.skipped}<span class="stat-icon">⊘</span></span>`);
-  if (j.failed  > 0) parts.push(`<span class="stat failed"  title="ошибок: ${j.failed}">${j.failed}<span class="stat-icon">✖</span></span>`);
+  if (j.failed  > 0) {
+    const failedTitle = j.lastErr
+      ? `ошибок: ${j.failed}\n\nпоследняя:\n${j.lastErr}`
+      : `ошибок: ${j.failed}`;
+    parts.push(`<span class="stat failed" title="${escape(failedTitle)}">${j.failed}<span class="stat-icon">✖</span></span>`);
+  }
   const body = parts.length ? parts.join(' ') : `<span class="stat muted">0</span>`;
   const totalSuffix = determinate ? ` <span class="muted">из ${j.limit}</span>` : '';
   return body + totalSuffix;
@@ -902,6 +978,9 @@ function renderPresetRow(v) {
   const rowTitle = v.outDir
     ? `Папка: ${v.outDir}`
     : 'Папка не задана';
+  const folderLine = v.outDir
+    ? `<span class="preset-outdir" title="${escape(v.outDir)}">📁 ${escape(v.outDir)}</span>`
+    : `<span class="preset-outdir muted">📁 не задана</span>`;
   return `
     <div class="preset-row" data-name="${escape(v.name)}" title="${escape(rowTitle)}">
       <div class="preset-row-main">
@@ -912,9 +991,13 @@ function renderPresetRow(v) {
         <div class="preset-actions">
           <button class="icon-btn" data-act="run"    title="${runTitle}" ${folderDisabled}>▶</button>
           <button class="icon-btn" data-act="folder" title="${folderTitle}" ${folderDisabled}>📂</button>
+          <button class="icon-btn" data-act="rebind" title="Сменить папку этого пресета (только outDir, остальные поля не трогаем)">✏️📁</button>
           <button class="icon-btn" data-act="load"   title="Загрузить в форму для редактирования">📋</button>
           <button class="icon-btn danger" data-act="delete" title="Удалить пресет">🗑</button>
         </div>
+      </div>
+      <div class="preset-outdir-row">
+        ${folderLine}
       </div>
       <div class="preset-schedule">
         <label class="preset-autopull-toggle" title="Включить периодическую автовыгрузку этого пресета по глобальному интервалу">
@@ -1628,6 +1711,30 @@ function wireEvents() {
     await pushAppSettings();
   });
 
+  $('#s-folder-split')?.addEventListener('change', async e => {
+    const n = Math.max(0, parseInt(e.target.value, 10) || 0);
+    if (state.appSettings.folderSplitEvery === n) return;
+    state.appSettings.folderSplitEvery = n;
+    e.target.value = n;
+    await pushAppSettings();
+  });
+
+  $('#s-folder-split-unit')?.addEventListener('change', async e => {
+    const v = e.target.value;
+    if (v !== 'posts' && v !== 'pages' && v !== 'files') return;
+    if (state.appSettings.folderSplitUnit === v) return;
+    state.appSettings.folderSplitUnit = v;
+    await pushAppSettings();
+  });
+
+  $('#s-cdn-min-interval')?.addEventListener('change', async e => {
+    const n = Math.max(0, parseInt(e.target.value, 10) || 0);
+    if (state.appSettings.cdnMinIntervalMs === n) return;
+    state.appSettings.cdnMinIntervalMs = n;
+    e.target.value = n;
+    await pushAppSettings();
+  });
+
   $('#btn-fill-onion')?.addEventListener('click', async () => {
     state.appSettings.onionBaseURL = DEFAULT_ONION_BASE_URL;
     state.networkTest = { state: 'idle' };
@@ -2158,7 +2265,12 @@ function collectInput(page) {
     username,
     minRating,
     maxRating,
-    sort: state.sort,
+    // state.sort holds the user's pick from a unified 6-button selector;
+    // split it back into the Go-side (Sort vs Feed) fields. Feed picks
+    // (all/best/good/new) flip the GraphQL entry point to Tag.postPager,
+    // where Sort is ignored.
+    sort: isFeedMode(state.sort) ? 'rating' : state.sort,
+    feed: isFeedMode(state.sort) ? state.sort : '',
     showNsfw: $('#f-nsfw')?.checked || false,
     onlyNsfw: $('#f-only-nsfw')?.checked || false,
     showUnsafe: $('#f-unsafe')?.checked || false,
@@ -2205,11 +2317,25 @@ function filterByKinds(posts) {
 }
 
 function sortResults(arr) {
+  // Feed-mode (Tag.postPager: all/best/good/new) imposes the order on
+  // the server — re-sorting locally would scramble what JR already
+  // arranged. Keep the original sequence so what shows in the grid
+  // matches what the queued job will iterate.
+  if (isFeedMode(state.sort)) {
+    return arr.slice();
+  }
   if (state.sort === 'date') {
     return [...arr].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   }
   // 'rating' (default)
   return [...arr].sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+}
+
+// isFeedMode reports whether a state.sort value names a Tag.postPager
+// line type instead of a Query.search sort key. Used everywhere the
+// preview/search flow has to choose between the two pipelines.
+function isFeedMode(v) {
+  return v === 'all' || v === 'best' || v === 'good' || v === 'new';
 }
 
 async function doSearch(reset) {
@@ -2531,7 +2657,10 @@ async function applyPreset(name) {
   state.selectedPosts.clear();
   state.tags = p.tags || [];
   state.excludeTags = p.excludeTags || [];
-  state.sort = p.sort || 'rating';
+  // Pre-feed presets only carry `sort` (rating/date). New presets save
+  // `feed` (all/best/good/new) when the user picked a Tag.postPager line
+  // type, and `feed` wins over `sort` when both are present.
+  state.sort = p.feed || p.sort || 'rating';
   state.kinds = sanitizeKinds(p.mediaKinds);
   // Output dir is part of the preset — when loading, swap to the preset's
   // dir. Empty preset.outDir falls back to the last-typed value so users
@@ -2583,7 +2712,10 @@ function collectPreset() {
     username: state.formInputs['f-user'] || '',
     minRating: num('f-min-rating'),
     maxRating: num('f-max-rating'),
-    sort: state.sort,
+    // Same split as searchInputFromForm: feed-line picks (all/best/good/new)
+    // go into `feed`, the search-sort picks (rating/date) into `sort`.
+    sort: isFeedMode(state.sort) ? 'rating' : state.sort,
+    feed: isFeedMode(state.sort) ? state.sort : '',
     showNsfw: !!state.formInputs['f-nsfw'],
     onlyNsfw: !!state.formInputs['f-only-nsfw'],
     showUnsafe: !!state.formInputs['f-unsafe'],
@@ -2698,18 +2830,142 @@ async function syncOutdirToPreset() {
 }
 
 async function doSavePreset() {
-  showPrompt('Сохранить пресет', 'Имя пресета', state.currentPreset || '', async name => {
+  // Snapshot the current form once — collectPreset() reads from DOM, so
+  // we must not delay calling it until after the user picks a folder in
+  // the modal (the picker steals focus and may clobber input state).
+  const draft = collectPreset();
+  showSavePresetPrompt(state.currentPreset || '', draft.outDir || '', async ({ name, outDir }) => {
     name = name.trim();
-    if (!name) return false;
-    const err = await SavePreset(name, collectPreset());
+    if (!name) return { error: 'имя не может быть пустым' };
+    // Common foot-gun: user opens an existing preset, changes filters but
+    // forgets to switch the folder, hits "Save as…" with a new name —
+    // and the new preset silently inherits the previous one's folder.
+    // Block that quietly: if the chosen folder already belongs to another
+    // preset (different name), ask for explicit confirmation.
+    const dup = await findPresetWithOutDir(outDir, name);
+    if (dup) {
+      const ok = await asyncConfirm(`Папка\n${outDir}\nуже привязана к пресету «${dup}». Точно сохранить «${name}» в ту же папку?`);
+      if (!ok) return { error: 'выбери другую папку и попробуй снова' };
+    }
+    const data = { ...draft, outDir };
+    const err = await SavePreset(name, data);
     if (err) return { error: err };
     state.currentPreset = name;
+    state.formInputs['f-outdir'] = outDir;
+    // Push the new outDir into the live DOM before triggering a render
+    // — otherwise render()'s captureInputs() reads the stale DOM value
+    // (the modal didn't touch the underlying form input) and rewrites
+    // state.formInputs back to whatever was there pre-save.
+    const dom = document.querySelector('#f-outdir');
+    if (dom) dom.value = outDir;
+    if (outDir) localStorage.setItem(LS_OUTDIR, outDir);
     localStorage.setItem(LS_LAST_PRESET, name);
     await refreshPresets();
     showToast('success', `Пресет «${name}» сохранён`);
-    render();
+    render({ skipCapture: true });
     return true;
   });
+}
+
+// findPresetWithOutDir returns the name of a preset (other than excludeName)
+// that has the exact same outDir. Case-insensitive on Windows path
+// comparison so D:\foo and d:\FOO are treated as the same folder.
+async function findPresetWithOutDir(outDir, excludeName) {
+  if (!outDir) return '';
+  const norm = s => (s || '').replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+  const target = norm(outDir);
+  for (const v of state.presetViews) {
+    if (v.name === excludeName) continue;
+    if (norm(v.outDir) === target) return v.name;
+  }
+  // presetViews is populated only when the modal has been opened —
+  // fall back to a fresh fetch so the check still works on first save.
+  try {
+    const fresh = (await ListPresetsDetailed()) || [];
+    for (const v of fresh) {
+      if (v.name === excludeName) continue;
+      if (norm(v.outDir) === target) return v.name;
+    }
+  } catch {}
+  return '';
+}
+
+// asyncConfirm wraps the imperative showConfirm() in a Promise so the
+// "Сохранить как…" flow can `await` the user's decision.
+function asyncConfirm(text) {
+  return new Promise(resolve => {
+    let answered = false;
+    const finish = v => { if (!answered) { answered = true; resolve(v); } };
+    showConfirm(text, () => finish(true));
+    // Hook the cancel + backdrop close paths: showConfirm doesn't expose
+    // a "rejected" callback, so we observe DOM removal as a fallback.
+    const obs = new MutationObserver(() => {
+      if (!document.querySelector('.modal-backdrop')) {
+        obs.disconnect();
+        finish(false);
+      }
+    });
+    obs.observe(document.body, { childList: true });
+  });
+}
+
+// showSavePresetPrompt — two-field dialog (name + folder picker). Used by
+// doSavePreset so the user explicitly sees and confirms the folder before
+// the preset is written. Folder defaults to whatever was in the form so
+// the existing "stay in the same folder" workflow still works in one click.
+function showSavePresetPrompt(defaultName, defaultOutDir, onSubmit) {
+  const m = document.createElement('div');
+  m.className = 'modal-backdrop';
+  m.innerHTML = `
+    <div class="modal">
+      <h3>Сохранить пресет</h3>
+      <div class="field">
+        <label>Имя пресета</label>
+        <input type="text" id="sp-name" value="${escape(defaultName)}">
+      </div>
+      <div class="field">
+        <label>Папка для скачивания</label>
+        <div class="outdir">
+          <input type="text" id="sp-outdir" value="${escape(defaultOutDir)}" placeholder="Папка…">
+          <button class="btn" id="sp-pick">Выбрать…</button>
+        </div>
+        <div class="field-hint">У каждого пресета своя папка. Папка наследуется от текущей формы — поменяй, если этот пресет должен качать в другое место.</div>
+      </div>
+      <div id="sp-err" style="color: #fca5a5; font-size: 13px; min-height: 18px;"></div>
+      <div class="actions">
+        <button class="btn" id="sp-cancel">Отмена</button>
+        <button class="btn primary" id="sp-ok">Ок</button>
+      </div>
+    </div>`;
+  document.body.appendChild(m);
+  const nameInput = m.querySelector('#sp-name');
+  const dirInput  = m.querySelector('#sp-outdir');
+  nameInput.focus(); nameInput.select();
+  const close = () => m.remove();
+  m.querySelector('#sp-cancel').addEventListener('click', close);
+  m.querySelector('#sp-pick').addEventListener('click', async () => {
+    const p = await PickFolder();
+    if (p) dirInput.value = p;
+  });
+  const submit = async () => {
+    m.querySelector('#sp-ok').disabled = true;
+    try {
+      const r = await onSubmit({ name: nameInput.value, outDir: dirInput.value.trim() });
+      if (r === true) { close(); return; }
+      if (r && r.error) m.querySelector('#sp-err').textContent = r.error;
+      m.querySelector('#sp-ok').disabled = false;
+    } catch (e) {
+      m.querySelector('#sp-err').textContent = String(e);
+      m.querySelector('#sp-ok').disabled = false;
+    }
+  };
+  m.querySelector('#sp-ok').addEventListener('click', submit);
+  const kdown = e => {
+    if (e.key === 'Enter')  submit();
+    if (e.key === 'Escape') close();
+  };
+  nameInput.addEventListener('keydown', kdown);
+  dirInput.addEventListener('keydown', kdown);
 }
 
 async function doDeletePreset() {
@@ -2768,6 +3024,50 @@ async function onPresetAction(name, act) {
       state.presetsManagerOpen = false;
       await applyPreset(name);
       showToast('success', `Пресет «${name}» загружен в форму`);
+      return;
+    }
+    case 'rebind': {
+      // Quick-fix entry point for the "preset has the wrong folder"
+      // foot-gun: open a folder picker and rewrite ONLY p.outDir,
+      // leaving every other field intact. Mirrors what the user could
+      // already do with «📋 Загрузить → 📂 поменять → Сохранить как тем
+      // же именем», but without the round trip through the form (where
+      // syncOutdirToPreset would also fire on every keystroke).
+      const path = await PickFolder();
+      if (!path) return;
+      const dup = await findPresetWithOutDir(path, name);
+      if (dup) {
+        const ok = await asyncConfirm(`Папка\n${path}\nуже привязана к пресету «${dup}». Точно перепривязать сюда и «${name}»?`);
+        if (!ok) return;
+      }
+      const p = await GetPreset(name);
+      if (!p) {
+        showToast('error', `Пресет «${name}» не найден`);
+        return;
+      }
+      p.outDir = path;
+      const err = await SavePreset(name, p);
+      if (err) {
+        showToast('error', err);
+        return;
+      }
+      // Keep the form's outdir in sync if this preset is the active one
+      // — otherwise the next save would happily overwrite our rebind.
+      if (state.currentPreset === name) {
+        state.formInputs['f-outdir'] = path;
+        // Mutate the live DOM input too, so the upcoming render()'s
+        // captureInputs() doesn't read the stale pre-rebind value and
+        // immediately clobber state.formInputs back to it. (skipCapture
+        // would also work, but other event-loop ticks between now and
+        // render may still call captureInputs; updating the DOM is the
+        // canonical source of truth.)
+        const dom = document.querySelector('#f-outdir');
+        if (dom) dom.value = path;
+        if (path) localStorage.setItem(LS_OUTDIR, path);
+      }
+      await refreshPresetViews();
+      render({ skipCapture: true });
+      showToast('success', `Папка пресета «${name}» изменена`);
       return;
     }
     case 'delete': {
@@ -3052,6 +3352,9 @@ document.addEventListener('visibilitychange', () => {
       state.appSettings.socks5Addr = app.socks5Addr || '';
       state.appSettings.onionBaseURL = app.onionBaseURL || '';
       state.appSettings.recoverDmcaViaOnion = !!app.recoverDmcaViaOnion;
+      state.appSettings.folderSplitEvery = Math.max(0, app.folderSplitEvery | 0);
+      state.appSettings.folderSplitUnit = (app.folderSplitUnit === 'pages' || app.folderSplitUnit === 'files') ? app.folderSplitUnit : 'posts';
+      state.appSettings.cdnMinIntervalMs = Math.max(0, app.cdnMinIntervalMs | 0);
       // FilenameFormat lives in AppSettings now (so the Go scheduler
       // can read it). If settings.json has a value, treat it as the
       // source of truth and override the localStorage cache; otherwise

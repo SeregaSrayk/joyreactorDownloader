@@ -35,6 +35,12 @@ type JobView struct {
 	Failed    int64  `json:"failed"`
 	Last      string `json:"last,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// LastErr is the message of the most recent per-picture Fetch
+	// failure (HTTP error, write error, etc.). Distinct from Error,
+	// which is the whole-job fatal error. Surfaced in the queue UI
+	// next to the ✖ counter so the user can see why downloads are
+	// failing without digging through wails logs.
+	LastErr   string `json:"lastErr,omitempty"`
 	Limit     int    `json:"limit"`
 	StartedAt int64  `json:"startedAt"`
 	EndedAt   int64  `json:"endedAt,omitempty"`
@@ -53,12 +59,13 @@ type job struct {
 	cancel context.CancelFunc
 	pause  *pauseGate
 
-	mu     sync.RWMutex
-	state  string
-	last   string
-	errMsg string
-	start  time.Time
-	end    time.Time
+	mu      sync.RWMutex
+	state   string
+	last    string
+	errMsg  string
+	lastErr string // most recent per-picture Fetch error, surfaced in UI next to the ✖ counter
+	start   time.Time
+	end     time.Time
 
 	saved   atomic.Int64
 	skipped atomic.Int64
@@ -73,6 +80,7 @@ func (j *job) view() JobView {
 		State:     j.state,
 		Last:      j.last,
 		Error:     j.errMsg,
+		LastErr:   j.lastErr,
 		Limit:     j.limit,
 		StartedAt: j.start.UnixMilli(),
 		Saved:     j.saved.Load(),
@@ -179,10 +187,16 @@ func (m *jobManager) emitRemoved(id string) {
 
 func (m *jobManager) run(j *job) {
 	workers := max1(j.input.Workers)
+	// Snapshot settings at job-start time so a toggle mid-run can't shift
+	// the manifest scope or the folder-split chunk size halfway through.
+	settings := loadAppSettings()
 	// Manifest scope follows AppSettings.ManifestMode. Resolved at job-start
 	// time so toggling the setting takes effect for new jobs but doesn't
 	// disturb anything already running.
 	dl := downloader.NewWithManifest(m.g.httpc, j.outDir, manifestPathFor(j.outDir))
+	if settings.FolderSplitEvery > 0 {
+		dl.EnableSplit(settings.FolderSplitEvery, downloader.SplitUnit(settings.FolderSplitUnitOrDefault()))
+	}
 	queue := make(chan downloader.Job, workers*2)
 
 	var wg sync.WaitGroup
@@ -199,6 +213,10 @@ func (m *jobManager) run(j *job) {
 				case err != nil:
 					if !errors.Is(err, context.Canceled) {
 						j.failed.Add(1)
+						msg := err.Error()
+						j.mu.Lock()
+						j.lastErr = msg
+						j.mu.Unlock()
 						wailsruntime.LogWarningf(m.g.ctx, "job %s: %v", j.id, err)
 					}
 				case ok:
@@ -220,9 +238,7 @@ func (m *jobManager) run(j *job) {
 		err = produceSelected(j.ctx, j.input.SelectedItems, dl, queue, j.pause, j.input.FilenameFormat)
 	} else {
 		c := m.g.mergeBlockedTags(criteriaFromDownload(j.input), j.input.UseBlockedTags)
-		// Snapshot settings at job-start time so a toggle mid-run can't change
-		// behaviour halfway through. Mirrors how dl/outDir are resolved above.
-		err = produce(j.ctx, m.g.gql, c, dl, queue, j.pause, j.input.FilenameFormat, loadAppSettings())
+		err = produce(j.ctx, m.g.gql, c, dl, queue, j.pause, j.input.FilenameFormat, settings)
 	}
 	close(queue)
 	wg.Wait()

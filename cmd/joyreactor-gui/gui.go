@@ -43,8 +43,14 @@ func NewGUI() *GUI { return &GUI{} }
 
 func (g *GUI) startup(ctx context.Context) {
 	g.ctx = ctx
-	g.gql = buildGqlClient(loadAppSettings())
+	settings := loadAppSettings()
+	// Build the GraphQL client with no transport — applyNetworkSettings
+	// below installs the SOCKS5 one if the user enabled it. Decoupling
+	// the constructor from the settings lets the same code path serve
+	// both "boot from settings.json" and "settings just changed in UI".
+	g.gql = graphql.NewClient("")
 	g.httpc = client.New()
+	g.applyNetworkSettings(settings)
 	g.sessionPath = sessionFilePath()
 	g.presets = loadPresets()
 	g.authors = loadAuthors()
@@ -301,6 +307,13 @@ type SearchInput struct {
 	MinRating      *int     `json:"minRating"`
 	MaxRating      *int     `json:"maxRating"`
 	Sort           string   `json:"sort"`
+	// Feed switches the entry point from Query.search to Tag.postPager
+	// with one of ALL/BEST/GOOD/NEW. Empty means search; "all"/"best"/
+	// "good"/"new" select the corresponding joyreactor.cc line type.
+	// When set, exactly one tag is required (it's the only thing
+	// Tag.postPager accepts) and Sort is ignored — feed ordering is
+	// imposed by JR.
+	Feed           string   `json:"feed"`
 	ShowNsfw       bool     `json:"showNsfw"`
 	OnlyNsfw       bool     `json:"onlyNsfw"`
 	ShowUnsafe     bool     `json:"showUnsafe"`
@@ -347,13 +360,31 @@ func (g *GUI) Search(in SearchInput) SearchOutput {
 	if page < 1 {
 		page = 1
 	}
-	res, err := g.gql.Search(g.ctx, buildSearchParams(c, page))
-	if err != nil {
-		return SearchOutput{Error: err.Error()}
+
+	var pager *graphql.PostPager
+	if c.Feed != filter.FeedSearch {
+		// Feed mode (Tag.postPager). Server has no filters here, only a
+		// single tag + line type — so we require exactly one tag and apply
+		// rating/NSFW client-side from the same Criteria struct.
+		if len(c.Tags) != 1 {
+			return SearchOutput{Error: errFeedNeedsOneTag.Error()}
+		}
+		pp, ferr := g.gql.TagPosts(g.ctx, c.Tags[0], feedLineType(c.Feed), page)
+		if ferr != nil {
+			return SearchOutput{Error: ferr.Error()}
+		}
+		pager = &pp
+	} else {
+		res, err := g.gql.Search(g.ctx, buildSearchParams(c, page))
+		if err != nil {
+			return SearchOutput{Error: err.Error()}
+		}
+		if res.PostPager == nil {
+			return SearchOutput{}
+		}
+		pager = res.PostPager
 	}
-	if res.PostPager == nil {
-		return SearchOutput{}
-	}
+	res := graphql.SearchResult{PostPager: pager}
 
 	out := SearchOutput{Count: res.PostPager.Count}
 	authors := make([]string, 0, len(res.PostPager.Posts))
@@ -371,6 +402,17 @@ func (g *GUI) Search(in SearchInput) SearchOutput {
 		// tagNamesForMatching expands aliases via Tag.mainTag.
 		if !c.MatchPostTags(tagNamesForMatching(p)) {
 			continue
+		}
+		// Feed mode has no server-side rating/NSFW filtering — apply both
+		// client-side. In search mode the server already pre-filtered, so
+		// skip the redundant pass to keep the existing behaviour identical.
+		if c.Feed != filter.FeedSearch {
+			if !c.MatchPostRating(p.Rating) {
+				continue
+			}
+			if !c.MatchPostNsfw(p.NSFW, p.Unsafe) {
+				continue
+			}
 		}
 		removed := p.IsRemoved()
 		// Recovery needs all three: opted in, mirror URL, and a working
@@ -554,18 +596,42 @@ func (g *GUI) GetAppSettings() AppSettings { return loadAppSettings() }
 // success or the error message. Change takes effect for the next job;
 // already-running jobs keep their downloader instances unchanged.
 //
-// As a side effect, the Autostart flag is synced to the OS-level
-// autostart registration (Windows registry, macOS LaunchAgent,
-// Linux .desktop) — this keeps the user's "should I auto-launch?"
-// preference in a single canonical place.
+// Side effects:
+//   - Autostart flag is synced to the OS-level autostart registration
+//     (Windows registry, macOS LaunchAgent, Linux .desktop) — single
+//     canonical place for "should I auto-launch?".
+//   - Network settings (SOCKS5 transport + CDN min-interval) are
+//     hot-reloaded onto the live graphql/http clients, so the user no
+//     longer has to restart the app to toggle Tor on/off.
 func (g *GUI) SaveAppSettings(s AppSettings) string {
 	if err := saveAppSettings(s); err != nil {
 		return err.Error()
 	}
+	g.applyNetworkSettings(s)
 	if err := syncAutostart(s.Autostart); err != nil {
 		return "настройки сохранены, но автозапуск не удалось обновить: " + err.Error()
 	}
 	return ""
+}
+
+// applyNetworkSettings pushes the current settings into the long-lived
+// graphql and HTTP clients without recreating them. The cookie jar and
+// session cookies stay intact — toggling SOCKS5 mid-session no longer
+// signs the user out.
+//
+// Called from startup (initial setup) and from SaveAppSettings (hot
+// reload after the user changes Сеть settings). Best-effort: socks
+// transport build errors silently fall back to direct, mirroring the
+// old buildGqlClient() behaviour — the settings UI already exposes a
+// «Проверить» button that surfaces misconfiguration explicitly.
+func (g *GUI) applyNetworkSettings(s AppSettings) {
+	transport, _ := socksTransport(s)
+	if g.gql != nil {
+		g.gql.SetTransport(transport)
+	}
+	if g.httpc != nil {
+		g.httpc.SetMinInterval(time.Duration(s.CdnMinIntervalMs) * time.Millisecond)
+	}
 }
 
 // OpenManifestFolder opens the directory that holds the active manifest
@@ -828,6 +894,9 @@ func (g *GUI) ListPresetsDetailed() []PresetView {
 // preset without expanding it.
 func presetSummary(p Preset) string {
 	var parts []string
+	if label := feedLineLabel(p.Feed); label != "" {
+		parts = append(parts, label)
+	}
 	switch {
 	case len(p.Tags) > 0:
 		tags := make([]string, 0, len(p.Tags))
@@ -937,6 +1006,12 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 	recoveryActive := settings.RecoverDmcaViaOnion &&
 		settings.OnionBaseURL != "" &&
 		settings.Socks5Enabled
+	// Feed mode (Tag.postPager) needs a single tag — anything else has
+	// no server-side equivalent. Bail early so the user gets a clear
+	// error in the queue card instead of an empty job.
+	if c.Feed != filter.FeedSearch && len(c.Tags) != 1 {
+		return errFeedNeedsOneTag
+	}
 	for page := startPage; ; page++ {
 		if c.PageTo > 0 && page > c.PageTo {
 			return nil
@@ -944,13 +1019,29 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 		if err := pause.Wait(ctx); err != nil {
 			return err
 		}
-		res, err := gql.Search(ctx, buildSearchParams(c, page))
-		if err != nil {
-			return fmt.Errorf("search page %d: %w", page, err)
+		var pager *graphql.PostPager
+		if c.Feed != filter.FeedSearch {
+			pp, err := gql.TagPosts(ctx, c.Tags[0], feedLineType(c.Feed), page)
+			if err != nil {
+				return fmt.Errorf("tag-feed page %d: %w", page, err)
+			}
+			pager = &pp
+		} else {
+			res, err := gql.Search(ctx, buildSearchParams(c, page))
+			if err != nil {
+				return fmt.Errorf("search page %d: %w", page, err)
+			}
+			pager = res.PostPager
 		}
+		res := graphql.SearchResult{PostPager: pager}
 		if res.PostPager == nil || len(res.PostPager.Posts) == 0 {
 			return nil
 		}
+		// SplitPages mode: rotate part-XXX once per page, regardless of
+		// how many posts/pictures the page actually contains. Reserve
+		// here (before the post loop) so every Job emitted from this
+		// page carries the same SubdirHint.
+		pageSubdir := dl.NextPageSubdir()
 		// Per-page onion recovery for DMCA-stubbed posts. Done before the main
 		// loop so we can splice recovered attributes back into the iteration
 		// transparently. Posts that fail to recover stay absent from the map
@@ -980,6 +1071,25 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 			if !c.MatchPostTags(tagNamesForMatching(p)) {
 				continue
 			}
+			// Feed mode skips server-side rating/NSFW filtering; replicate it
+			// client-side so the user's settings still apply. Search mode
+			// already pre-filtered on the server, so don't double-apply.
+			if c.Feed != filter.FeedSearch {
+				if !c.MatchPostRating(p.Rating) {
+					continue
+				}
+				if !c.MatchPostNsfw(p.NSFW, p.Unsafe) {
+					continue
+				}
+			}
+			// SplitPosts mode: reserve a part-XXX lazily on the first
+			// picture we actually want from this post, then reuse it
+			// for every other picture of the same post. Posts that
+			// pass the filters but yield zero downloadable attrs don't
+			// consume a slot — matches "every post that contributes a
+			// file gets its own boundary spot".
+			postSubdir := ""
+			postSubdirReserved := false
 			for _, a := range attrs {
 				if a.Type != graphql.AttrPicture || a.Image == nil {
 					continue
@@ -995,10 +1105,19 @@ func produce(ctx context.Context, gql *graphql.Client, c filter.Criteria, dl *do
 					continue
 				}
 				seen[a.ID] = struct{}{}
+				if !postSubdirReserved {
+					postSubdir = dl.NextPostSubdir()
+					postSubdirReserved = true
+				}
+				hint := pageSubdir
+				if postSubdir != "" {
+					hint = postSubdir
+				}
 				job := downloader.Job{
-					URL:  url,
-					Name: buildFilename(p, a, nameFormat),
-					Key:  a.ID,
+					URL:        url,
+					Name:       buildFilename(p, a, nameFormat),
+					Key:        a.ID,
+					SubdirHint: hint,
 				}
 				select {
 				case <-ctx.Done():
@@ -1056,6 +1175,7 @@ func criteriaFromSearch(in SearchInput) filter.Criteria {
 		MinRating:    in.MinRating,
 		MaxRating:    in.MaxRating,
 		Sort:         parseSort(in.Sort),
+		Feed:         parseFeed(in.Feed),
 		ShowNsfw:     in.ShowNsfw,
 		OnlyNsfw:     in.OnlyNsfw,
 		ShowUnsafe:   in.ShowUnsafe,
@@ -1132,6 +1252,60 @@ func parseSort(s string) filter.SortMode {
 	default:
 		return filter.SortRating
 	}
+}
+
+func parseFeed(s string) filter.FeedMode {
+	switch s {
+	case "all":
+		return filter.FeedAll
+	case "best":
+		return filter.FeedBest
+	case "good":
+		return filter.FeedGood
+	case "new":
+		return filter.FeedNew
+	default:
+		return filter.FeedSearch
+	}
+}
+
+// feedLineType maps the FeedMode onto the GraphQL PostLineType enum used
+// by Tag.postPager. Caller must check c.Feed != "" before invoking.
+func feedLineType(f filter.FeedMode) graphql.PostLineType {
+	switch f {
+	case filter.FeedAll:
+		return graphql.LineAll
+	case filter.FeedBest:
+		return graphql.LineBest
+	case filter.FeedGood:
+		return graphql.LineGood
+	case filter.FeedNew:
+		return graphql.LineNew
+	default:
+		return graphql.LineGood
+	}
+}
+
+// errFeedNeedsOneTag is returned by Search/produce when feed mode was
+// requested but the tag count isn't exactly one. Tag.postPager takes a
+// single tag name, so multi-tag / no-tag inputs have no equivalent.
+var errFeedNeedsOneTag = errors.New("режим «лента тега» требует ровно один тег")
+
+// feedLineLabel returns a short human label for the preset-summary row.
+// Empty string for the default search mode keeps the existing summary
+// shape unchanged for legacy presets.
+func feedLineLabel(feed string) string {
+	switch feed {
+	case "all":
+		return "📜 бездна"
+	case "best":
+		return "📜 лучшее"
+	case "good":
+		return "📜 хорошее"
+	case "new":
+		return "📜 новое"
+	}
+	return ""
 }
 
 func parseDate(s string) (time.Time, error) {
@@ -1341,12 +1515,17 @@ func sanitizeWindowsFilename(s string) string {
 // caller passed the same post twice). dl's manifest still skips on-disk
 // duplicates downstream.
 func produceSelected(ctx context.Context, items []SelectedItem, dl *downloader.Downloader, jobs chan<- downloader.Job, pause *pauseGate, format string) error {
-	_ = dl // reserved for future per-item UI events, mirrors produce()
 	seen := make(map[string]struct{})
 	for _, it := range items {
 		if err := pause.Wait(ctx); err != nil {
 			return err
 		}
+		// SplitPosts: reserve a part-XXX once per selected post, lazily on
+		// the first downloadable picture (skipping duplicates from earlier
+		// selections). SplitPages doesn't apply here — there are no
+		// "pages" in the hand-picked flow.
+		postSubdir := ""
+		postSubdirReserved := false
 		for _, pic := range it.Pictures {
 			if pic.AttrID == "" || pic.URL == "" {
 				continue
@@ -1355,10 +1534,15 @@ func produceSelected(ctx context.Context, items []SelectedItem, dl *downloader.D
 				continue
 			}
 			seen[pic.AttrID] = struct{}{}
+			if !postSubdirReserved {
+				postSubdir = dl.NextPostSubdir()
+				postSubdirReserved = true
+			}
 			job := downloader.Job{
-				URL:  pic.URL,
-				Name: buildFilenamePrim(it.PostID, pic.AttrID, pic.Type, it.Tags, format),
-				Key:  pic.AttrID,
+				URL:        pic.URL,
+				Name:       buildFilenamePrim(it.PostID, pic.AttrID, pic.Type, it.Tags, format),
+				Key:        pic.AttrID,
+				SubdirHint: postSubdir,
 			}
 			select {
 			case <-ctx.Done():

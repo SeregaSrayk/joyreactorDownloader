@@ -131,19 +131,6 @@ func humanizeNetErr(err error) string {
 	return msg
 }
 
-// buildGqlClient turns AppSettings into a configured *graphql.Client. When
-// SOCKS5 is enabled with a valid address, GraphQL traffic is routed through
-// that proxy. CDN downloads (internal/client) are NOT touched here — they
-// always stay direct, because Tor is too slow for binary media transfers.
-//
-// On any setup error we silently fall back to the direct client rather than
-// failing startup — better a working app than a dead one, and the settings
-// UI lets the user notice + fix the misconfiguration.
-func buildGqlClient(s AppSettings) *graphql.Client {
-	transport, _ := socksTransport(s)
-	return graphql.NewClientWithTransport("", transport)
-}
-
 // socksTransport builds an http.RoundTripper whose connections go through the
 // configured SOCKS5 proxy. Returns (nil, nil) when SOCKS5 is disabled — the
 // caller treats that as "use the default direct transport".

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +25,12 @@ type Client struct {
 	mu       sync.Mutex
 	minDelay time.Duration
 	lastCall time.Time
+
+	// txMu guards http.Transport swap-in for hot-reload of SOCKS5/onion
+	// settings without recreating the Client (and losing the cookie jar /
+	// session). SetTransport takes it write-side; doOnce takes it read-side
+	// before issuing the request.
+	txMu sync.RWMutex
 }
 
 func NewClient(endpoint string) *Client {
@@ -62,6 +69,25 @@ func (c *Client) Endpoint() string { return c.endpoint }
 
 // Jar returns the underlying cookie jar so the GUI can persist/restore sessions.
 func (c *Client) Jar() http.CookieJar { return c.jar }
+
+// SetTransport hot-swaps the underlying http.Transport so SOCKS5 / onion
+// settings can be toggled at runtime without recreating the Client (which
+// would drop the cookie jar and force the user to log in again).
+//
+// Pass nil to revert to the default direct transport. The HTTP timeout is
+// stretched to 60s when a custom transport is in play because Tor hidden
+// services add hundreds of ms baseline latency.
+func (c *Client) SetTransport(t http.RoundTripper) {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
+	if t == nil {
+		c.http.Transport = nil
+		c.http.Timeout = 30 * time.Second
+		return
+	}
+	c.http.Transport = t
+	c.http.Timeout = 60 * time.Second
+}
 
 type gqlError struct {
 	Message string `json:"message"`
@@ -126,7 +152,11 @@ func (c *Client) doOnce(ctx context.Context, query string, vars map[string]any, 
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.ua)
 
+	// RLock pairs with SetTransport: prevents a SetTransport call from
+	// mutating http.Client.Transport while http.Client.Do is reading it.
+	c.txMu.RLock()
 	resp, err := c.http.Do(req)
+	c.txMu.RUnlock()
 	if err != nil {
 		return err
 	}
@@ -145,7 +175,18 @@ func (c *Client) doOnce(ctx context.Context, query string, vars map[string]any, 
 		return fmt.Errorf("decode response: %w", err)
 	}
 	if len(r.Errors) > 0 {
-		return fmt.Errorf("graphql error: %s", r.Errors[0].Message)
+		msg := r.Errors[0].Message
+		// JR's GraphQL rate-limiter signals the cap by returning HTTP 200
+		// with `{"errors":[{"message":"Rate ..."}]}` in the body — NOT
+		// HTTP 429. Discovered by looking at corax4/JoySave, which
+		// detects the same prefix to know when to wait. Route through
+		// ErrRateLimited so the surrounding Do() exponential-backoff
+		// retry path catches it, instead of bubbling up to the caller
+		// as a fatal "graphql error: Rate ...".
+		if strings.HasPrefix(msg, "Rate") {
+			return ErrRateLimited
+		}
+		return fmt.Errorf("graphql error: %s", msg)
 	}
 	if out != nil {
 		if err := json.Unmarshal(r.Data, out); err != nil {

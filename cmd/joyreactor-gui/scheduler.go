@@ -110,6 +110,7 @@ func downloadInputFromPreset(p Preset) DownloadInput {
 			MinRating:    p.MinRating,
 			MaxRating:    p.MaxRating,
 			Sort:         p.Sort,
+			Feed:         p.Feed,
 			ShowNsfw:     p.ShowNsfw,
 			OnlyNsfw:     p.OnlyNsfw,
 			ShowUnsafe:   p.ShowUnsafe,
